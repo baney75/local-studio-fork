@@ -255,8 +255,13 @@ impl Smoke {
     }
 
     fn ls(&self, args: &[&str]) -> Result<(i32, Value), String> {
+        self.ls_without(args, &[])
+    }
+
+    fn ls_without(&self, args: &[&str], remove: &[&str]) -> Result<(i32, Value), String> {
         let shim = |name: &str| self.shims.join(name);
-        let out = Command::new(&self.bin)
+        let mut command = Command::new(&self.bin);
+        command
             .args(args)
             .env("HOME", &self.home)
             .env("LOCAL_STUDIO_DATA_DIR", &self.data)
@@ -273,9 +278,11 @@ impl Smoke {
             .env("SHIM_STATE", &self.state)
             .env_remove("LS_TUNNEL_SERVICE")
             .env_remove("TUNNEL_ORIGIN_CERT")
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|e| format!("{}: {e}", self.bin.display()))?;
+            .stdin(Stdio::null());
+        for name in remove {
+            command.env_remove(name);
+        }
+        let out = command.output().map_err(|e| format!("{}: {e}", self.bin.display()))?;
         let stdout = String::from_utf8_lossy(&out.stdout);
         let code = out.status.code().unwrap_or(-1);
         println!("$ local-studio {}\n  exit {code}: {}", args.join(" "), stdout.trim());
@@ -373,11 +380,55 @@ fn run() -> Result<(), String> {
         closed_port,
     };
     println!("scratch: {}", smoke.root.display());
+    guard(&smoke)?;
     cloudflare(&smoke)?;
     tailnet(&smoke)?;
     adopt(&smoke)?;
     adopt_fails_to_start(&smoke)?;
     adopt_fails_after_stop(&smoke)?;
+    contained(&smoke)
+}
+
+fn real_manager() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "LS_LAUNCHCTL"
+    } else {
+        "LS_SYSTEMCTL"
+    }
+}
+
+fn guard(s: &Smoke) -> Result<(), String> {
+    let mark = s.mark();
+    for args in
+        [&["tunnel", "off", "--json"][..], &["tunnel", "setup", "--cloudflare", "studio.example.com", "--json"][..]]
+    {
+        let (code, value) = s.ls_without(args, &[real_manager()])?;
+        ensure(
+            code == 1 && value["code"] == "unsafe_service_path",
+            format!("the real service manager with a scratch HOME must be refused: {value}"),
+        )?;
+    }
+    ensure(s.since(mark).is_empty(), "a refused run touches nothing")?;
+    println!("ok: the real service manager with a scratch HOME is refused");
+    Ok(())
+}
+
+fn contained(s: &Smoke) -> Result<(), String> {
+    let home = s.home.display().to_string();
+    for line in s.log_lines() {
+        let service_file = line.contains(".plist") || line.contains(".service");
+        if service_file && line.contains('/') {
+            ensure(line.contains(&home), format!("a service path outside the scratch HOME: {line}"))?;
+        }
+    }
+    if let Some(real) = std::env::var_os("HOME").map(PathBuf::from) {
+        for name in
+            ["Library/LaunchAgents/com.localstudio.tunnel.plist", ".config/systemd/user/local-studio-tunnel.service"]
+        {
+            ensure(!real.join(name).exists(), format!("{} must not exist", real.join(name).display()))?;
+        }
+    }
+    println!("ok: every plist and unit stayed under the scratch HOME");
     Ok(())
 }
 
@@ -535,6 +586,10 @@ fn tychicus_fixture(s: &Smoke) -> Result<(), String> {
 
 fn adopt(s: &Smoke) -> Result<(), String> {
     tychicus_fixture(s)?;
+    let mark = s.mark();
+    let (code, value) = s.ls_without(&["tunnel", "adopt", "--json"], &[real_manager()])?;
+    ensure(code == 1 && value["code"] == "unsafe_service_path", format!("adopt with the real manager: {value}"))?;
+    ensure(s.since(mark).is_empty(), "a refused adopt touches nothing")?;
     let mark = s.mark();
     let (code, value) = s.ls(&["tunnel", "adopt", "--hostname", "new.example.com", "--json"])?;
     ensure(code == 0 && value["state"] == "confirm", "adopt without --yes answers confirm")?;

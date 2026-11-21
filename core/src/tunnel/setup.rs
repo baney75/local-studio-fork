@@ -308,6 +308,59 @@ fn listening(port: u16) -> bool {
     TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], port)), Duration::from_secs(1)).is_ok()
 }
 
+fn canonical(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn real_manager(var: &str, system: &Path) -> bool {
+    match std::env::var_os(var).filter(|value| !value.is_empty()) {
+        None => true,
+        Some(chosen) => canonical(Path::new(&chosen)) == canonical(system),
+    }
+}
+
+async fn account_home() -> Option<PathBuf> {
+    let id = crate::workspace::process::which("id").unwrap_or_else(|| PathBuf::from("/usr/bin/id"));
+    if cfg!(target_os = "macos") {
+        let name = run(&id, &argv(&["-un"])).await.ok().filter(Out::ok)?.stdout.trim().to_string();
+        if name.is_empty() || name.contains('/') {
+            return None;
+        }
+        let out =
+            run(Path::new("/usr/bin/dscl"), &argv(&[".", "-read", &format!("/Users/{name}"), "NFSHomeDirectory"]))
+                .await
+                .ok()
+                .filter(Out::ok)?;
+        let dir = out.stdout.lines().find_map(|line| line.strip_prefix("NFSHomeDirectory:"))?.trim().to_string();
+        return (!dir.is_empty()).then(|| canonical(Path::new(&dir)));
+    }
+    let uid = run(&id, &argv(&["-u"])).await.ok().filter(Out::ok)?.stdout.trim().to_string();
+    let getent = crate::workspace::process::which("getent")?;
+    let out = run(&getent, &argv(&["passwd", &uid])).await.ok().filter(Out::ok)?;
+    let dir = out.stdout.lines().next()?.split(':').nth(5)?.trim().to_string();
+    (!dir.is_empty()).then(|| canonical(Path::new(&dir)))
+}
+
+fn service_guard(manager: &str, real: bool, home: &Path, account: Option<&Path>) -> Result<(), Failure> {
+    let unsafe_path = |message: String| Err(fail("unsafe_service_path", message));
+    match (real, account) {
+        (_, None) => unsafe_path(format!(
+            "Couldn't read this account's home folder, so Local Studio can't tell whether {manager} and HOME ({}) belong together. Nothing was changed.",
+            home.display()
+        )),
+        (true, Some(account)) if account != home => unsafe_path(format!(
+            "HOME is {}, not this account's home {}, but {manager} is the real one, so its services would change for a folder that isn't yours. Nothing was changed.",
+            home.display(),
+            account.display()
+        )),
+        (false, Some(account)) if account == home => unsafe_path(format!(
+            "{manager} is a stand-in (LS_LAUNCHCTL or LS_SYSTEMCTL) while HOME is this account's real home {}, so real service files would be written for a fake service manager. Nothing was changed.",
+            account.display()
+        )),
+        _ => Ok(()),
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Service {
     label: &'static str,
@@ -325,6 +378,8 @@ impl Manager {
         let home = home()?;
         if cfg!(target_os = "macos") {
             let launchctl = tool("LS_LAUNCHCTL", "launchctl").unwrap_or_else(|| PathBuf::from("/bin/launchctl"));
+            let real = real_manager("LS_LAUNCHCTL", Path::new("/bin/launchctl"));
+            service_guard("launchctl", real, &canonical(&home), account_home().await.as_deref())?;
             let uid = run(Path::new("/usr/bin/id"), &argv(&["-u"])).await?;
             let uid = uid.stdout.trim().to_string();
             if uid.is_empty() || !uid.bytes().all(|b| b.is_ascii_digit()) {
@@ -340,6 +395,9 @@ impl Manager {
             let systemctl = tool("LS_SYSTEMCTL", "systemctl").ok_or_else(|| {
                 fail("no_service_manager", "systemctl wasn't found, so Local Studio can't keep the tunnel running.")
             })?;
+            let system = crate::workspace::process::which("systemctl").unwrap_or_default();
+            let real = real_manager("LS_SYSTEMCTL", &system);
+            service_guard("systemctl", real, &canonical(&home), account_home().await.as_deref())?;
             return Ok(Self::Systemd { systemctl, units: home.join(".config").join("systemd").join("user") });
         }
         Err(fail(
@@ -1309,10 +1367,14 @@ impl Tunnel {
             ));
         }
         let mut removed = Vec::new();
-        if let Ok(manager) = Manager::detect().await {
-            if manager.remove(OWN).await.map_err(|error| fail("service_failed", error))? {
-                removed.push("service".to_string());
+        match Manager::detect().await {
+            Ok(manager) => {
+                if manager.remove(OWN).await.map_err(|error| fail("service_failed", error))? {
+                    removed.push("service".to_string());
+                }
             }
+            Err(failure) if failure.code == "unsupported" => {}
+            Err(failure) => return Err(failure),
         }
         let mounts = self.tailnet_record();
         if !mounts.is_empty() {
@@ -1384,6 +1446,42 @@ async fn join_tychicus() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_real_service_manager_needs_the_real_home_and_a_stand_in_needs_another() {
+        let real = Path::new("/Users/someone");
+        let scratch = Path::new("/tmp/scratch/home");
+        assert!(service_guard("launchctl", true, real, Some(real)).is_ok());
+        assert!(service_guard("launchctl", false, scratch, Some(real)).is_ok());
+        for (is_real, home, account) in
+            [(true, scratch, Some(real)), (false, real, Some(real)), (true, real, None), (false, scratch, None)]
+        {
+            let refused = service_guard("launchctl", is_real, home, account).err().map(|f| f.code);
+            assert_eq!(refused.as_deref(), Some("unsafe_service_path"), "{is_real} {home:?} {account:?}");
+        }
+    }
+
+    #[test]
+    fn service_files_stay_in_the_home_service_folders() {
+        let home = Path::new("/tmp/scratch/home");
+        let agents = home.join("Library").join("LaunchAgents");
+        let units = home.join(".config").join("systemd").join("user");
+        let managers = [
+            Manager::Launchd { launchctl: PathBuf::from("x"), domain: "gui/501".into(), agents: agents.clone() },
+            Manager::Systemd { systemctl: PathBuf::from("x"), units: units.clone() },
+        ];
+        for manager in &managers {
+            for service in [OWN, TYCHICUS] {
+                let file = manager.file(service);
+                let parent = file.parent().map(Path::to_path_buf).unwrap_or_default();
+                assert!(parent == agents || parent == units, "{}", file.display());
+                assert!(file.file_name().is_some_and(|name| {
+                    let name = name.to_string_lossy();
+                    name == format!("{}.plist", service.label) || name == service.unit
+                }));
+            }
+        }
+    }
 
     #[test]
     fn only_dev_opens_setup() {
