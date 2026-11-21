@@ -534,6 +534,33 @@ impl Manager {
         Err(format!("{} {} failed: {}", self.name(), args.join(" "), out.text()))
     }
 
+    async fn retire(&self, service: Service) -> Result<(), String> {
+        let args = match self {
+            Self::Launchd { .. } => argv(&["disable", &self.target(service)]),
+            Self::Systemd { .. } => argv(&["disable", "--now", service.unit]),
+        };
+        let out = self.call(&args).await?;
+        if !out.ok() {
+            return Err(format!("{} {} failed: {}", self.name(), args.join(" "), out.text()));
+        }
+        match self {
+            Self::Launchd { .. } => self.stop(service).await,
+            Self::Systemd { .. } => Ok(()),
+        }
+    }
+
+    async fn restore(&self, service: Service) -> Result<(), String> {
+        let args = match self {
+            Self::Launchd { .. } => argv(&["enable", &self.target(service)]),
+            Self::Systemd { .. } => argv(&["enable", service.unit]),
+        };
+        let out = self.call(&args).await?;
+        if !out.ok() {
+            return Err(format!("{} {} failed: {}", self.name(), args.join(" "), out.text()));
+        }
+        self.start(service).await
+    }
+
     async fn remove(&self, service: Service) -> Result<bool, String> {
         let file = self.file(service);
         if !file.exists() {
@@ -1250,7 +1277,7 @@ impl Tunnel {
         steps.push(format!("Install and start {} ({}).", OWN.what, manager.file(OWN).display()));
         steps.push(format!("Check {} answer.", names.join(" and ")));
         steps.push(format!(
-            "Stop {} ({}), keeping its files, then check again.",
+            "Disable and stop {} ({}) so it doesn't start again at login, keeping its files, then check again.",
             TYCHICUS.what,
             manager.file(TYCHICUS).display()
         ));
@@ -1282,7 +1309,7 @@ impl Tunnel {
         let _ = fs::remove_file(self.dir.join(YML));
         let mut message = format!("{cause} Adopting was rolled back: Local Studio's tunnel service was removed");
         if stopped {
-            match manager.start(TYCHICUS).await {
+            match manager.restore(TYCHICUS).await {
                 Ok(()) if manager.wait_running(TYCHICUS).await => {
                     message.push_str(", and Tychicus's tunnel runs again.");
                 }
@@ -1324,8 +1351,8 @@ impl Tunnel {
             .await
             .map_err(|failure| failure.message)?;
         if was_running {
-            manager.stop(TYCHICUS).await?;
             *stopped = true;
+            manager.retire(TYCHICUS).await?;
             self.public_checks(names, ports, true)
                 .await
                 .map_err(|error| format!("After Tychicus's tunnel stopped: {error}"))?;

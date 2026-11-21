@@ -38,13 +38,17 @@ case "$1" in
     label=${2##*/}
     [ -f "$svc/$label" ] || exit 113
     if [ -f "$SHIM_STATE/fail-$label" ]; then echo "state = not running"; else echo "state = running"; fi ;;
+  disable) touch "$svc/disabled-${2##*/}" ;;
+  enable) rm -f "$svc/disabled-${2##*/}" ;;
   bootstrap)
     label=$(basename "$3" .plist)
+    [ -f "$svc/disabled-$label" ] && { echo "Bootstrap failed: 5: Input/output error" >&2; exit 5; }
     [ -f "$3" ] || { echo "Bootstrap failed: 5: Input/output error" >&2; exit 5; }
     touch "$svc/$label" ;;
   bootout)
     label=${2##*/}
     [ -f "$svc/$label" ] || { echo "Boot-out failed: 3: No such process" >&2; exit 3; }
+    [ -f "$SHIM_STATE/fail-stop-$label" ] && { echo "Boot-out failed: 5: Input/output error" >&2; exit 5; }
     rm -f "$svc/$label" ;;
 esac
 exit 0
@@ -64,7 +68,11 @@ case "$1" in
   is-active)
     if [ -f "$svc/$2" ] && [ ! -f "$SHIM_STATE/fail-$2" ]; then echo active; else echo inactive; exit 3; fi ;;
   stop) rm -f "$svc/$2" ;;
-  disable) rm -f "$svc/$last" ;;
+  disable)
+    [ -f "$SHIM_STATE/fail-stop-$last" ] && { echo "Failed to disable unit" >&2; exit 1; }
+    touch "$svc/disabled-$last"
+    rm -f "$svc/$last" ;;
+  enable) rm -f "$svc/disabled-$last" ;;
 esac
 exit 0
 "#;
@@ -361,11 +369,29 @@ impl Smoke {
     fn stop_line(own: bool) -> String {
         if cfg!(target_os = "macos") {
             format!("launchctl bootout gui/{}/{}", uid(), Self::service_name(own))
-        } else if own {
-            format!("systemctl --user disable --now {}", Self::service_name(own))
         } else {
-            format!("systemctl --user stop {}", Self::service_name(own))
+            format!("systemctl --user disable --now {}", Self::service_name(own))
         }
+    }
+
+    fn disable_line() -> String {
+        if cfg!(target_os = "macos") {
+            format!("launchctl disable gui/{}/{}", uid(), Self::service_name(false))
+        } else {
+            format!("systemctl --user disable --now {}", Self::service_name(false))
+        }
+    }
+
+    fn enable_line() -> String {
+        if cfg!(target_os = "macos") {
+            format!("launchctl enable gui/{}/{}", uid(), Self::service_name(false))
+        } else {
+            format!("systemctl --user enable {}", Self::service_name(false))
+        }
+    }
+
+    fn disabled(&self) -> bool {
+        self.state.join("svc").join(format!("disabled-{}", Self::service_name(false))).exists()
     }
 
     fn started_line(&self, own: bool) -> String {
@@ -452,6 +478,7 @@ fn run() -> Result<(), String> {
     adopt(&smoke)?;
     adopt_fails_to_start(&smoke)?;
     adopt_fails_after_stop(&smoke)?;
+    adopt_fails_to_stop(&smoke)?;
     contained(&smoke)
 }
 
@@ -699,6 +726,7 @@ fn tychicus_fixture(s: &Smoke) -> Result<(), String> {
     fs::write(&file, "tychicus service fixture\n").map_err(|e| e.to_string())?;
     fs::create_dir_all(s.state.join("svc")).map_err(|e| e.to_string())?;
     fs::write(s.state.join("svc").join(Smoke::service_name(false)), "").map_err(|e| e.to_string())?;
+    let _ = fs::remove_file(s.state.join("svc").join(format!("disabled-{}", Smoke::service_name(false))));
     Ok(())
 }
 
@@ -733,13 +761,18 @@ fn adopt(s: &Smoke) -> Result<(), String> {
     let started = Smoke::at(&lines, &s.started_line(true))?;
     let checked = Smoke::at(&lines, "check new.example.com /v1/health 200")?;
     let old_checked = Smoke::at(&lines, "check old.example.com /v1/health 200")?;
+    let disabled = Smoke::at(&lines, &Smoke::disable_line())?;
     let stopped = Smoke::at(&lines, &Smoke::stop_line(false))?;
     let joined = Smoke::at(&lines, "tychicus remote join --json")?;
     ensure(
-        started < checked && checked < stopped && old_checked < stopped && stopped < joined,
+        started < checked && checked < disabled && old_checked < disabled && disabled <= stopped && stopped < joined,
         format!(
-            "order must be start {started} < checks {checked},{old_checked} < Tychicus stop {stopped} < join {joined}"
+            "order must be start {started} < checks {checked},{old_checked} < Tychicus disable {disabled} <= stop {stopped} < join {joined}"
         ),
+    )?;
+    ensure(
+        s.disabled() && !Smoke::has(&lines, &Smoke::enable_line()),
+        "Tychicus's service stays disabled after adopt",
     )?;
     ensure(
         !s.service_running(false) && s.service_file(false).exists(),
@@ -790,6 +823,10 @@ fn adopt_fails_to_start(s: &Smoke) -> Result<(), String> {
         !Smoke::has(&lines, &Smoke::stop_line(false)),
         "Tychicus's service is never stopped when the new one fails",
     )?;
+    ensure(
+        !Smoke::has(&lines, &Smoke::disable_line()) && !Smoke::has(&lines, &Smoke::enable_line()) && !s.disabled(),
+        "Tychicus's service is never disabled when the new one fails",
+    )?;
     ensure(!Smoke::has(&lines, "tychicus remote join"), "no join after a rollback")?;
     println!("ok: adopt rolls back when Local Studio's service fails to start");
     Ok(())
@@ -804,10 +841,36 @@ fn adopt_fails_after_stop(s: &Smoke) -> Result<(), String> {
     fs::remove_file(&fail).map_err(|e| e.to_string())?;
     rolled_back(s, &value, code)?;
     let lines = s.since(mark);
+    let disabled = Smoke::at(&lines, &Smoke::disable_line())?;
     let stopped = Smoke::at(&lines, &Smoke::stop_line(false))?;
+    let enabled = Smoke::at(&lines, &Smoke::enable_line())?;
     let restarted = Smoke::at(&lines, &s.started_line(false))?;
-    ensure(stopped < restarted, "Tychicus's service is started again after it was stopped")?;
+    ensure(
+        disabled <= stopped && stopped < enabled && enabled < restarted && !s.disabled(),
+        format!("order must be disable {disabled} <= stop {stopped} < enable {enabled} < start {restarted}"),
+    )?;
     ensure(!Smoke::has(&lines, "tychicus remote join"), "no join after a rollback")?;
-    println!("ok: adopt rolls back and restarts Tychicus when the route fails after the switch");
+    println!("ok: adopt rolls back, enabling then restarting Tychicus, when the route fails after the switch");
+    Ok(())
+}
+
+fn adopt_fails_to_stop(s: &Smoke) -> Result<(), String> {
+    tychicus_fixture(s)?;
+    let fail = s.state.join(format!("fail-stop-{}", Smoke::service_name(false)));
+    fs::write(&fail, "").map_err(|e| e.to_string())?;
+    let mark = s.mark();
+    let (code, value) = s.ls(&["tunnel", "adopt", "--yes", "--json"])?;
+    fs::remove_file(&fail).map_err(|e| e.to_string())?;
+    rolled_back(s, &value, code)?;
+    let lines = s.since(mark);
+    let disabled = Smoke::at(&lines, &Smoke::disable_line())?;
+    let enabled = Smoke::at(&lines, &Smoke::enable_line())?;
+    let restarted = Smoke::at(&lines, &s.started_line(false))?;
+    ensure(
+        disabled < enabled && enabled < restarted && !s.disabled(),
+        format!("order must be disable {disabled} < enable {enabled} < start {restarted}"),
+    )?;
+    ensure(!Smoke::has(&lines, "tychicus remote join"), "no join after a rollback")?;
+    println!("ok: adopt rolls back, enabling then restarting Tychicus, when Tychicus won't stop");
     Ok(())
 }
