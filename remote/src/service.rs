@@ -133,8 +133,55 @@ fn systemd_unit(arguments: &[String], variables: &[(String, String)]) -> String 
     text
 }
 
+const TAILNET_PATHS: [&str; 2] = ["/v1/health", "/v1/ws"];
+
+fn tailscale_bin() -> String {
+    std::env::var("LS_TAILSCALE").ok().filter(|path| !path.is_empty()).unwrap_or_else(|| "tailscale".to_string())
+}
+
+fn mount(https_port: u16, path: &str, port: u16) -> Vec<String> {
+    vec![
+        "serve".to_string(),
+        "--bg".to_string(),
+        "--yes".to_string(),
+        format!("--https={https_port}"),
+        format!("--set-path={path}"),
+        format!("http://127.0.0.1:{port}{path}"),
+    ]
+}
+
+fn unmount(https_port: u16, path: &str) -> Vec<String> {
+    vec!["serve".to_string(), format!("--https={https_port}"), format!("--set-path={path}"), "off".to_string()]
+}
+
+fn shown(commands: &[Vec<String>]) -> Vec<Vec<String>> {
+    commands.iter().map(|command| std::iter::once(tailscale_bin()).chain(command.iter().cloned()).collect()).collect()
+}
+
+fn run_tailscale(command: &[String]) -> anyhow::Result<()> {
+    let args: Vec<&str> = command.iter().map(String::as_str).collect();
+    checked(&tailscale_bin(), &args).map(drop)
+}
+
+fn route_host(data_dir: &Path) -> anyhow::Result<Option<String>> {
+    let path = data_dir.join("tunnel").join("route.json");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    };
+    let record: Value = serde_json::from_str(&text).with_context(|| format!("{} is not JSON", path.display()))?;
+    let host = record
+        .get("hostname")
+        .and_then(Value::as_str)
+        .filter(|host| !host.is_empty())
+        .with_context(|| format!("{} names no hostname", path.display()))?;
+    settings::check_host(host)?;
+    Ok(Some(host.to_string()))
+}
+
 fn tailscale_host() -> anyhow::Result<String> {
-    let said = checked("tailscale", &["status", "--json"])?;
+    let said = checked(&tailscale_bin(), &["status", "--json"])?;
     let status: Value = serde_json::from_str(&said).context("tailscale status --json is not JSON")?;
     let name = status.pointer("/Self/DNSName").and_then(Value::as_str).unwrap_or_default().trim_end_matches('.');
     ensure!(!name.is_empty(), "tailscale reports no DNS name for this machine: is it logged in to a tailnet?");
@@ -197,22 +244,50 @@ pub fn install(mut args: Args) -> anyhow::Result<()> {
     let mut settings = settings::load(&data_dir)?.unwrap_or_default().merged(&flags);
     let config = settings.effective(&host_name());
     ensure!(config.tunnel_port != Some(config.port), "the tunnel port must differ from the local port {}", config.port);
-    if tailscale && no_load {
-        out.say(format_args!("--no-load: skipped tailscale serve"));
-    } else if tailscale {
-        let host = tailscale_host()?;
-        checked(
-            "tailscale",
-            &["serve", "--bg", &format!("--https={https_port}"), &format!("http://127.0.0.1:{}", config.port)],
-        )?;
-        out.say(format_args!(
-            "tailscale serve: https://{host}:{https_port} forwards to http://127.0.0.1:{}",
-            config.port
-        ));
+    let mut served = Value::Null;
+    if tailscale {
+        let route = route_host(&data_dir)?;
+        let host = match &route {
+            Some(host) => host.clone(),
+            None => tailscale_host()?,
+        };
+        let paths: Vec<String> =
+            if route.is_some() { Vec::new() } else { TAILNET_PATHS.iter().map(ToString::to_string).collect() };
+        let commands: Vec<Vec<String>> = paths.iter().map(|path| mount(https_port, path, config.port)).collect();
+        let state = if route.is_some() {
+            out.say(format_args!(
+                "{} names {host}: its route owns tailscale serve, so install mounts nothing",
+                data_dir.join("tunnel").join("route.json").display()
+            ));
+            "route"
+        } else if no_load {
+            for command in &commands {
+                out.say(format_args!("--no-load: would run tailscale {}", command.join(" ")));
+            }
+            "planned"
+        } else {
+            for command in &commands {
+                run_tailscale(command)?;
+            }
+            out.say(format_args!(
+                "tailscale serve: https://{host}:{https_port} {} forward to http://127.0.0.1:{}",
+                paths.join(" and "),
+                config.port
+            ));
+            "mounted"
+        };
         if !settings.allow_hosts.contains(&host) {
             settings.allow_hosts.push(host.clone());
         }
-        settings.tailscale = Some(Tailscale { https_port, host });
+        let mounted = if state == "mounted" { paths.clone() } else { Vec::new() };
+        served = json!({
+            "state": state,
+            "host": host,
+            "httpsPort": https_port,
+            "paths": paths,
+            "commands": shown(&commands),
+        });
+        settings.tailscale = Some(Tailscale { https_port, host, paths: mounted });
     }
     settings::save(&data_dir, &settings)?;
     out.say(format_args!("Wrote {}", settings::path(&data_dir).display()));
@@ -246,7 +321,7 @@ pub fn install(mut args: Args) -> anyhow::Result<()> {
         "log": unit.log,
         "settingsPath": settings::path(&data_dir),
         "serveJson": settings,
-        "tailscale": settings.tailscale,
+        "tailscale": served,
     }));
     Ok(())
 }
@@ -278,17 +353,33 @@ pub fn uninstall(mut args: Args) -> anyhow::Result<()> {
     }
     if let Some(settings) = settings::load(&data_dir)? {
         if let Some(added) = &settings.tailscale {
-            if no_load {
-                tailscale = json!({ "state": "left", "httpsPort": added.https_port, "host": added.host });
-                out.say(format_args!("--no-load: left the tailscale serve entry on https port {}", added.https_port));
+            let commands: Vec<Vec<String>> = added.paths.iter().map(|path| unmount(added.https_port, path)).collect();
+            let state = if commands.is_empty() {
+                "none"
+            } else if no_load {
+                for command in &commands {
+                    out.say(format_args!("--no-load: would run tailscale {}", command.join(" ")));
+                }
+                "left"
             } else {
-                checked("tailscale", &["serve", &format!("--https={}", added.https_port), "off"])?;
-                tailscale = json!({ "state": "removed", "httpsPort": added.https_port, "host": added.host });
+                for command in &commands {
+                    run_tailscale(command)?;
+                }
                 out.say(format_args!(
-                    "Removed the tailscale serve entry on https port {} ({})",
-                    added.https_port, added.host
+                    "Removed tailscale serve {} on https port {} ({})",
+                    added.paths.join(" and "),
+                    added.https_port,
+                    added.host
                 ));
-            }
+                "removed"
+            };
+            tailscale = json!({
+                "state": state,
+                "host": added.host,
+                "httpsPort": added.https_port,
+                "paths": added.paths,
+                "commands": shown(&commands),
+            });
         }
         let path = settings::path(&data_dir);
         std::fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
@@ -392,8 +483,10 @@ pub fn status(mut args: Args) -> anyhow::Result<()> {
             out.say(format_args!("serve.json: {}: {}", path.display(), describe_settings(&config)));
             if let Some(added) = &stored.tailscale {
                 out.say(format_args!(
-                    "tailscale serve: https port {} for {}, added by install",
-                    added.https_port, added.host
+                    "tailscale serve: {} on https port {} for {}, added by install",
+                    if added.paths.is_empty() { "no paths".to_string() } else { added.paths.join(" and ") },
+                    added.https_port,
+                    added.host
                 ));
             }
         }

@@ -57,6 +57,8 @@ impl Hook {
 pub struct Tailscale {
     pub https_port: u16,
     pub host: String,
+    #[serde(default)]
+    pub paths: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

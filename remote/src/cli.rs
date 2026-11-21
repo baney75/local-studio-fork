@@ -27,6 +27,7 @@ const USAGE: &str = "usage:
   local-studio-serve pair [--url <wss url>] [--port 18093] [--name <name>] [--data-dir <dir>]
   local-studio-serve devices [--data-dir <dir>]
   local-studio-serve revoke (<device id or name> | --all) [--data-dir <dir>]
+  local-studio-serve allow-host [--remove] [--json] <name> [--data-dir <dir>]
   local-studio-serve allow-tunnel-host [--remove] [--json] <name> [--data-dir <dir>]
   local-studio-serve install [--tailscale] [--https-port 443] [--bin <path>] [--eukhe <path>] [--no-load] [--json] [serve flags]
   local-studio-serve uninstall [--no-load] [--json] [--data-dir <dir>]
@@ -149,7 +150,8 @@ fn run() -> anyhow::Result<()> {
         "pair" => pair(args),
         "devices" => list(args),
         "revoke" => revoke(args),
-        "allow-tunnel-host" => allow_tunnel_host(args),
+        "allow-host" => allow(args, Allow::Local),
+        "allow-tunnel-host" => allow(args, Allow::Tunnel),
         "install" => service::install(args),
         "uninstall" => service::uninstall(args),
         "status" => service::status(args),
@@ -373,39 +375,78 @@ fn serve(mut args: Args) -> anyhow::Result<()> {
     }
 }
 
-fn allow_tunnel_host(mut args: Args) -> anyhow::Result<()> {
+#[derive(Clone, Copy)]
+enum Allow {
+    Local,
+    Tunnel,
+}
+
+impl Allow {
+    fn list(self) -> &'static str {
+        match self {
+            Self::Local => "allowHosts",
+            Self::Tunnel => "allowTunnelHosts",
+        }
+    }
+
+    fn port_key(self) -> &'static str {
+        match self {
+            Self::Local => "port",
+            Self::Tunnel => "tunnelPort",
+        }
+    }
+
+    fn listener(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Tunnel => "tunnel",
+        }
+    }
+}
+
+fn allow(mut args: Args, which: Allow) -> anyhow::Result<()> {
     let out = Out::new(&mut args);
     let remove = args.switch("--remove");
     let data_dir = args.data_dir()?;
-    let Some(name) = args.0.first().cloned() else { bail!("name the tunnel host\n{USAGE}") };
+    let Some(name) = args.0.first().cloned() else { bail!("name the host\n{USAGE}") };
     args.0.remove(0);
     args.done()?;
     settings::check_host(&name)?;
     let mut settings = settings::load(&data_dir)?.unwrap_or_default();
-    let present = settings.allow_tunnel_hosts.contains(&name);
-    if remove {
-        settings.allow_tunnel_hosts.retain(|host| host != &name);
-    } else if !present {
-        settings.allow_tunnel_hosts.push(name.clone());
-    }
-    if !remove && settings.tunnel_port.is_none() {
+    if matches!(which, Allow::Tunnel) && !remove && settings.tunnel_port.is_none() {
         settings.tunnel_port = Some(settings::DEFAULT_TUNNEL_PORT);
     }
+    let port = match which {
+        Allow::Local => settings.port.unwrap_or(settings::DEFAULT_PORT),
+        Allow::Tunnel => settings.tunnel_port.unwrap_or(settings::DEFAULT_TUNNEL_PORT),
+    };
+    let hosts = match which {
+        Allow::Local => &mut settings.allow_hosts,
+        Allow::Tunnel => &mut settings.allow_tunnel_hosts,
+    };
+    let present = hosts.contains(&name);
+    if remove {
+        hosts.retain(|host| host != &name);
+    } else if !present {
+        hosts.push(name.clone());
+    }
+    let hosts = hosts.clone();
     settings::save(&data_dir, &settings)?;
     let path = settings::path(&data_dir);
-    let tunnel_port = settings.tunnel_port.unwrap_or(settings::DEFAULT_TUNNEL_PORT);
+    let list = which.list();
     let state = match (remove, present) {
         (true, true) => "removed",
         (false, false) => "added",
         _ => "unchanged",
     };
     match (remove, present) {
-        (true, true) => out.say(format_args!("Removed {name} from allowTunnelHosts in {}.", path.display())),
-        (true, false) => out.say(format_args!("{name} was not in allowTunnelHosts in {}.", path.display())),
-        (false, true) => out.say(format_args!("{name} is already in allowTunnelHosts in {}.", path.display())),
+        (true, true) => out.say(format_args!("Removed {name} from {list} in {}.", path.display())),
+        (true, false) => out.say(format_args!("{name} was not in {list} in {}.", path.display())),
+        (false, true) => out.say(format_args!("{name} is already in {list} in {}.", path.display())),
         (false, false) => out.say(format_args!(
-            "Added {name} to allowTunnelHosts in {}; the tunnel listener is 127.0.0.1:{tunnel_port}.",
-            path.display()
+            "Added {name} to {list} in {}; the {} listener is 127.0.0.1:{port}.",
+            path.display(),
+            which.listener()
         )),
     }
     let owner = match lock::holder(&data_dir) {
@@ -416,10 +457,10 @@ fn allow_tunnel_host(mut args: Args) -> anyhow::Result<()> {
     if let (Some(Some(pid)), Some("local-studio-serve")) = (owner, process.as_deref()) {
         std::process::Command::new("kill").args(["-HUP", &pid.to_string()]).status().ok();
     }
-    let live = owner.is_some() && picked_up(tunnel_port, &name, !remove);
+    let live = owner.is_some() && picked_up(port, &name, !remove);
     if live {
         out.say(format_args!(
-            "{} picked it up: 127.0.0.1:{tunnel_port} answers accordingly.",
+            "{} picked it up: 127.0.0.1:{port} answers accordingly.",
             lock::describe(owner.flatten())
         ));
     } else if owner.is_some() {
@@ -434,15 +475,18 @@ fn allow_tunnel_host(mut args: Args) -> anyhow::Result<()> {
             data_dir.display()
         ));
     }
-    out.object(&json!({
-        "state": state,
-        "host": name,
-        "allowTunnelHosts": settings.allow_tunnel_hosts,
-        "tunnelPort": tunnel_port,
-        "live": live,
-        "owner": owner.map(|pid| json!({ "pid": pid, "kind": process.as_deref().map_or("unknown", lock::kind_id) })),
-        "settingsPath": path,
-    }));
+    let mut object = serde_json::Map::new();
+    object.insert("state".to_string(), json!(state));
+    object.insert("host".to_string(), json!(name));
+    object.insert(list.to_string(), json!(hosts));
+    object.insert(which.port_key().to_string(), json!(port));
+    object.insert("live".to_string(), json!(live));
+    object.insert(
+        "owner".to_string(),
+        json!(owner.map(|pid| json!({ "pid": pid, "kind": process.as_deref().map_or("unknown", lock::kind_id) }))),
+    );
+    object.insert("settingsPath".to_string(), json!(path));
+    out.object(&Value::Object(object));
     Ok(())
 }
 

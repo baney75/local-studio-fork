@@ -33,6 +33,8 @@ const TAKEOVER: Duration = Duration::from_secs(15);
 const BACK: Duration = Duration::from_secs(2);
 const WAITING: &str = "serve waits and tries again";
 const TUNNEL: &str = "studio.handoff.test";
+const TAILNET: &str = "box.tail1234.ts.net";
+const ROUTED: &str = "studio-box.tail1234.ts.net";
 const SECOND: &str = "studio-parish1.handoff.test";
 
 struct Quiet;
@@ -658,6 +660,7 @@ async fn takeover(run: &mut Run, phone: &Phone, mut link: Link) -> anyhow::Resul
     let second = health(run.tunnel, SECOND).await;
     ensure!(second == Some(200), "{SECOND} got {second:?} from the app's tunnel listener");
     println!("ok   the app's in-process server picked up {SECOND} live (no SIGHUP): {added}");
+    allow_host_live(run, "box-app.handoff.test", app, "the app").await?;
     Ok(link)
 }
 
@@ -703,6 +706,33 @@ async fn tunnel_removed(run: &Run) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn allow_host_live(run: &Run, host: &str, owner: u32, label: &str) -> anyhow::Result<()> {
+    let before = health(run.port, host).await;
+    ensure!(before == Some(403), "{host} got {before:?} on the local listener before allow-host");
+    let added = tokio::task::block_in_place(|| run.json(&["allow-host", host]))?;
+    expect(&added, "/state", &json!("added"), "allow-host --json")?;
+    expect(&added, "/port", &json!(run.port), "allow-host --json")?;
+    expect(&added, "/live", &json!(true), "allow-host --json")?;
+    expect(&added, "/owner/pid", &json!(owner), "allow-host --json")?;
+    ensure!(
+        added.get("allowHosts").and_then(Value::as_array).is_some_and(|hosts| hosts.contains(&json!(host))),
+        "allow-host --json lists no {host}: {added}"
+    );
+    let now = health(run.port, host).await;
+    ensure!(now == Some(200), "live was true but {host} got {now:?} on the local listener");
+    let crossed = health(run.tunnel, host).await;
+    ensure!(crossed == Some(403), "{host} got {crossed:?} on the tunnel listener");
+    let again = tokio::task::block_in_place(|| run.json(&["allow-host", host]))?;
+    expect(&again, "/state", &json!("unchanged"), "a repeated allow-host --json")?;
+    let removed = tokio::task::block_in_place(|| run.json(&["allow-host", "--remove", host]))?;
+    expect(&removed, "/state", &json!("removed"), "allow-host --remove --json")?;
+    expect(&removed, "/live", &json!(true), "allow-host --remove --json")?;
+    let gone = health(run.port, host).await;
+    ensure!(gone == Some(403), "after allow-host --remove {host} got {gone:?}");
+    println!("ok   allow-host --json under {label}: {added}; 200 on the local listener, 403 on the tunnel listener, 403 again after --remove");
+    Ok(())
+}
+
 fn default_tunnel_port(run: &Run) -> anyhow::Result<()> {
     let data = run.root.join("fresh");
     let args = ["allow-tunnel-host", "fresh.handoff.test", "--json"];
@@ -718,22 +748,149 @@ fn default_tunnel_port(run: &Run) -> anyhow::Result<()> {
         "allow-tunnel-host wrote {written}"
     );
     println!("ok   allow-tunnel-host --json on a fresh data dir: {added} (nothing listens on 18094 for it)");
+    let args = ["allow-host", "fresh-box.handoff.test", "--json"];
+    let local = json_of(Command::new(&run.bin).args(args).arg("--data-dir").arg(&data), &args)?;
+    expect(&local, "/state", &json!("added"), "allow-host --json on a fresh data dir")?;
+    expect(&local, "/port", &json!(18093), "allow-host --json on a fresh data dir")?;
+    expect(&local, "/allowHosts", &json!(["fresh-box.handoff.test"]), "allow-host --json on a fresh data dir")?;
+    expect(&local, "/live", &json!(false), "allow-host --json on a fresh data dir")?;
+    expect(&local, "/owner", &Value::Null, "allow-host --json on a fresh data dir")?;
+    println!("ok   allow-host --json on a fresh data dir: {local}");
+    Ok(())
+}
+
+struct Services {
+    bin: PathBuf,
+    home: PathBuf,
+    shim: PathBuf,
+    calls: PathBuf,
+}
+
+impl Services {
+    fn new(run: &Run) -> anyhow::Result<Self> {
+        let home = run.root.join("service-home");
+        std::fs::create_dir_all(&home)?;
+        let calls = run.root.join("tailscale-calls.log");
+        let shim = run.root.join("tailscale-shim");
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> '{}'\ncase \"$1\" in status) echo '{{\"Self\":{{\"DNSName\":\"{TAILNET}.\"}}}}' ;; esac\n",
+                calls.display()
+            ),
+        )?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))?;
+        }
+        Ok(Self { bin: run.bin.clone(), home, shim, calls })
+    }
+
+    fn json(&self, dir: &Path, args: &[&str]) -> anyhow::Result<Value> {
+        json_of(
+            Command::new(&self.bin)
+                .args(args)
+                .arg("--json")
+                .arg("--data-dir")
+                .arg(dir)
+                .env("HOME", &self.home)
+                .env("LS_TAILSCALE", &self.shim),
+            args,
+        )
+    }
+
+    fn commands(&self, tail: impl Fn(&str) -> Vec<String>) -> Value {
+        let shim = self.shim.to_string_lossy().into_owned();
+        json!(["/v1/health", "/v1/ws"]
+            .iter()
+            .map(|path| std::iter::once(shim.clone()).chain(tail(path)).collect::<Vec<_>>())
+            .collect::<Vec<_>>())
+    }
+
+    fn calls(&self) -> String {
+        read(&self.calls)
+    }
+}
+
+fn tailnet_planned(services: &Services, installed: &Value, port: &str) -> anyhow::Result<()> {
+    let what = "install --tailscale --no-load --json";
+    let mounts = services.commands(|path| {
+        [
+            "serve",
+            "--bg",
+            "--yes",
+            "--https=443",
+            &format!("--set-path={path}"),
+            &format!("http://127.0.0.1:{port}{path}"),
+        ]
+        .map(String::from)
+        .to_vec()
+    });
+    expect(installed, "/tailscale/state", &json!("planned"), what)?;
+    expect(installed, "/tailscale/host", &json!(TAILNET), what)?;
+    expect(installed, "/tailscale/paths", &json!(["/v1/health", "/v1/ws"]), what)?;
+    expect(installed, "/tailscale/commands", &mounts, what)?;
+    expect(installed, "/serveJson/tailscale/paths", &json!([]), what)?;
+    ensure!(
+        services.calls().lines().collect::<Vec<_>>() == ["status --json"],
+        "install --no-load ran tailscale beyond status:\n{}",
+        services.calls()
+    );
+    println!("ok   install --tailscale --no-load plans only /v1/health and /v1/ws, never /: {mounts}");
+    Ok(())
+}
+
+fn tailnet_unmounts(services: &Services, settings: &Path, written: &Value) -> anyhow::Result<Value> {
+    let mut mounted = written.clone();
+    mounted["tailscale"]["paths"] = json!(["/v1/health", "/v1/ws"]);
+    std::fs::write(settings, serde_json::to_vec_pretty(&mounted)?)?;
+    let data = settings.parent().and_then(Path::parent).context("serve.json has no data dir")?;
+    let removed = services.json(data, &["uninstall", "--no-load"])?;
+    let unmounts = services
+        .commands(|path| ["serve", "--https=443", &format!("--set-path={path}"), "off"].map(String::from).to_vec());
+    expect(&removed, "/tailscale/state", &json!("left"), "uninstall --no-load --json")?;
+    expect(&removed, "/tailscale/commands", &unmounts, "uninstall --no-load --json")?;
+    ensure!(services.calls().lines().count() == 1, "uninstall --no-load ran tailscale:\n{}", services.calls());
+    println!("ok   uninstall --no-load plans removing only the two paths install added: {unmounts}");
+    Ok(removed)
+}
+
+fn route_install(run: &Run, services: &Services, port: &str) -> anyhow::Result<()> {
+    let routed = run.root.join("route-data");
+    std::fs::create_dir_all(routed.join("tunnel"))?;
+    std::fs::write(
+        routed.join("tunnel").join("route.json"),
+        json!({"v":1,"owner":"local-studio","route":"tailnet","hostname":ROUTED,"aliases":[],"ports":{"mcp":8787,"serve":18093}}).to_string(),
+    )?;
+    let before = services.calls();
+    let bin = run.bin.to_string_lossy().into_owned();
+    let installed = services.json(&routed, &["install", "--no-load", "--tailscale", "--port", port, "--bin", &bin])?;
+    let what = "install --tailscale with route.json";
+    expect(&installed, "/tailscale/state", &json!("route"), what)?;
+    expect(&installed, "/tailscale/host", &json!(ROUTED), what)?;
+    expect(&installed, "/tailscale/commands", &json!([]), what)?;
+    expect(&installed, "/serveJson/allowHosts", &json!([ROUTED]), what)?;
+    ensure!(services.calls() == before, "install with route.json ran tailscale:\n{}", services.calls());
+    let removed = services.json(&routed, &["uninstall", "--no-load"])?;
+    expect(&removed, "/tailscale/state", &json!("none"), "uninstall after a route.json install")?;
+    expect(&removed, "/tailscale/commands", &json!([]), "uninstall after a route.json install")?;
+    ensure!(services.calls() == before, "uninstall after a route.json install ran tailscale:\n{}", services.calls());
+    println!("ok   with route.json, install --tailscale mounts nothing and allows {ROUTED}; uninstall removes nothing: {installed}");
     Ok(())
 }
 
 fn service_files(run: &Run) -> anyhow::Result<()> {
-    let home = run.root.join("service-home");
+    let services = Services::new(run)?;
+    let home = &services.home;
     let data = run.root.join("service-data");
-    std::fs::create_dir_all(&home)?;
     let port = free_port()?.to_string();
-    let service = |args: &[&str]| -> anyhow::Result<Value> {
-        json_of(Command::new(&run.bin).args(args).arg("--json").arg("--data-dir").arg(&data).env("HOME", &home), args)
-    };
+    let service = |args: &[&str]| services.json(&data, args);
     let bin = run.bin.to_string_lossy().into_owned();
     let eukhe = run.eukhe.to_string_lossy().into_owned();
     let installed = service(&[
         "install",
         "--no-load",
+        "--tailscale",
         "--port",
         &port,
         "--allow-host",
@@ -759,7 +916,8 @@ fn service_files(run: &Run) -> anyhow::Result<()> {
     expect(&installed, "/loaded", &json!(false), "install --no-load --json")?;
     expect(&installed, "/unit", &json!(unit), "install --no-load --json")?;
     expect(&installed, "/settingsPath", &json!(settings), "install --no-load --json")?;
-    expect(&installed, "/serveJson/allowHosts", &json!(["box.handoff.test"]), "install --no-load --json")?;
+    expect(&installed, "/serveJson/allowHosts", &json!(["box.handoff.test", TAILNET]), "install --no-load --json")?;
+    tailnet_planned(&services, &installed, &port)?;
     let text = read(&unit);
     ensure!(!text.is_empty(), "install wrote no {}: {installed}", unit.display());
     for needle in needles.iter().copied().chain([bin.as_str(), eukhe.as_str(), "serve", "--data-dir"]) {
@@ -771,7 +929,7 @@ fn service_files(run: &Run) -> anyhow::Result<()> {
     let written: Value = serde_json::from_str(&read(&settings))?;
     ensure!(
         written.get("port").and_then(Value::as_u64) == port.parse().ok()
-            && written.get("allowHosts") == Some(&json!(["box.handoff.test"])),
+            && written.get("allowHosts") == Some(&json!(["box.handoff.test", TAILNET])),
         "install wrote {written}"
     );
     println!("ok   install --no-load --json: {installed}");
@@ -781,14 +939,14 @@ fn service_files(run: &Run) -> anyhow::Result<()> {
     expect(&status, "/service/state", &json!("installed"), "status --json with nothing running")?;
     expect(&status, "/listeners/0/listening", &json!(false), "status --json with nothing running")?;
     println!("ok   status --json with the service written and nothing running: {status}");
-    let removed = service(&["uninstall", "--no-load"])?;
+    let removed = tailnet_unmounts(&services, &settings, &written)?;
     expect(&removed, "/state", &json!("uninstalled"), "uninstall --no-load --json")?;
     expect(&removed, "/removed", &json!([unit, settings]), "uninstall --no-load --json")?;
     ensure!(!unit.exists() && !settings.exists(), "uninstall left {} or {}", unit.display(), settings.display());
     let again = service(&["uninstall", "--no-load"])?;
     expect(&again, "/state", &json!("absent"), "a repeated uninstall --json")?;
     println!("ok   uninstall --no-load --json removed both: {removed}; again: {again}");
-    Ok(())
+    route_install(run, &services, &port)
 }
 
 async fn drive(run: &mut Run) -> anyhow::Result<()> {
@@ -800,6 +958,7 @@ async fn drive(run: &mut Run) -> anyhow::Result<()> {
     );
     println!("ok   a phone paired with serve and got a snapshot");
     let link = tunnel_live(run, &phone, link).await?;
+    allow_host_live(run, "box-serve.handoff.test", run.serve_pid()?, "serve").await?;
     let link = takeover(run, &phone, link).await?;
     let mut link = hand_back(run, &phone, link).await?;
     tunnel_removed(run).await?;
