@@ -1032,6 +1032,7 @@ fn desktop_run(
         data_dir: Some(data.to_string_lossy().into_owned()),
         launch: Some(DaemonLaunch { program: eukhe.to_string_lossy().into_owned() }),
         controller_main: None,
+        take_over_serve: false,
     };
     let studio =
         Studio::new(config, Arc::clone(&signal) as Arc<dyn Waker>).map_err(|error| anyhow::anyhow!("{error}"))?;
@@ -1315,28 +1316,28 @@ async fn transport_checks(run: &mut Run, eukhe: &Path) -> anyhow::Result<()> {
     println!("ok   a socket with a mismatched Origin gets 403");
 
     let rival_port = free_port()?;
-    let mut rival = run.serve.command();
-    let mut rival = rival
+    let rival_log = run.serve.root.join("rival.log");
+    let mut rival = run
+        .serve
+        .command()
         .args(["serve", "--port", &rival_port.to_string(), "--eukhe"])
         .arg(eukhe)
         .arg("--data-dir")
         .arg(&run.serve.data)
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(std::fs::File::create(&rival_log)?)
         .spawn()?;
-    let deadline = Instant::now() + QUICK;
-    while rival.try_wait()?.is_none() {
-        if Instant::now() >= deadline {
-            Command::new("kill").args(["-KILL", &rival.id().to_string()]).status()?;
-            rival.wait()?;
-            bail!("a second serve on the same data dir kept running");
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    let output = rival.wait_with_output()?;
-    let said = String::from_utf8_lossy(&output.stderr);
-    ensure!(!output.status.success() && said.contains("already owns"), "a second serve said: {said}");
-    println!("ok   a second serve on the data dir is refused: {}", said.trim());
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let running = rival.try_wait()?.is_none();
+    Command::new("kill").args(["-KILL", &rival.id().to_string()]).status()?;
+    rival.wait()?;
+    let said = std::fs::read_to_string(&rival_log).unwrap_or_default();
+    ensure!(running, "a second serve on the same data dir exited instead of waiting: {said}");
+    ensure!(
+        said.matches("serve waits and tries again").count() == 1,
+        "a second serve did not log the wait exactly once: {said}"
+    );
+    println!("ok   a second serve on the data dir waits for the lock and logs it once: {}", said.trim());
 
     for (protocol, min_protocol) in [(3, 3), (1, 1)] {
         let mut socket =

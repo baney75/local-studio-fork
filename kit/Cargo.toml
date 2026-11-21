@@ -18,5 +18,8 @@ path = "src/bin/uniffi-bindgen.rs"
 local-studio-core = { workspace = true, features = ["ffi"] }
 uniffi = { workspace = true, features = ["cli"] }
 
+[target.'cfg(unix)'.dependencies]
+local-studio-remote.workspace = true
+
 [lints]
 workspace = true

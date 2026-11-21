@@ -404,6 +404,7 @@ fn run(daemon: &Path, root: &Path, stub: Option<u16>) -> anyhow::Result<()> {
         data_dir: None,
         launch: Some(DaemonLaunch { program: daemon.to_string_lossy().into_owned() }),
         controller_main: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../controller/src/main.ts").to_string()),
+        take_over_serve: false,
     };
     let outcome = Harness::new(config).and_then(|mut harness| {
         let outcome = drive(&mut harness, &agent, &work, stub, &original);

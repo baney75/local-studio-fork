@@ -1,9 +1,11 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
-use local_studio_core::{FileContent, ImageAttachment, Item, PromptDraft, Studio, TranscriptOp, Update, Waker};
+use local_studio_core::{
+    FileContent, ImageAttachment, Item, PromptDraft, Studio, Subscription, TranscriptOp, Update, Waker,
+};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Notify};
 
@@ -644,12 +646,26 @@ pub struct Resume {
     pub watch: Vec<String>,
 }
 
+pub enum Feed {
+    Tick,
+    Subscription(Subscription),
+}
+
+impl Feed {
+    fn drain(&self, studio: &Studio) -> Vec<Update> {
+        match self {
+            Self::Tick => studio.tick(),
+            Self::Subscription(subscription) => subscription.tick(),
+        }
+    }
+}
+
 pub struct Hub {
     studio: Arc<Studio>,
     state: Mutex<State>,
-    pub machine: Value,
+    machine: RwLock<Value>,
     pub epoch: String,
-    hooks: Vec<String>,
+    hooks: RwLock<Vec<String>>,
     http: reqwest::Client,
 }
 
@@ -657,18 +673,47 @@ impl Hub {
     pub fn new(studio: Arc<Studio>, machine: Value, hooks: Vec<String>) -> anyhow::Result<Arc<Self>> {
         let http = reqwest::Client::builder().timeout(NOTIFY_TIMEOUT).build()?;
         let epoch = hex(&random::<8>()?);
-        Ok(Arc::new(Self { studio, state: Mutex::new(State::default()), machine, epoch, hooks, http }))
+        Ok(Arc::new(Self {
+            studio,
+            state: Mutex::new(State::default()),
+            machine: RwLock::new(machine),
+            epoch,
+            hooks: RwLock::new(hooks),
+            http,
+        }))
+    }
+
+    fn machine(&self) -> Value {
+        self.machine.read().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    pub fn set_machine(&self, name: &str, urls: &[String]) {
+        let mut machine = self.machine.write().unwrap_or_else(PoisonError::into_inner);
+        machine["name"] = json!(name);
+        machine["urls"] = json!(urls);
+    }
+
+    pub fn set_hooks(&self, hooks: Vec<String>) {
+        *self.hooks.write().unwrap_or_else(PoisonError::into_inner) = hooks;
+    }
+
+    pub fn close_all(&self, code: u16, reason: &str) {
+        let mut state = self.state();
+        for session in state.sessions.values_mut() {
+            session.close(code, reason);
+            session.left_at = Some(Instant::now());
+        }
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    pub async fn pump(self: Arc<Self>, notify: Arc<Notify>) {
+    pub async fn pump(self: Arc<Self>, notify: Arc<Notify>, feed: Feed) {
         self.studio.load_models();
         loop {
             notify.notified().await;
-            for update in self.studio.tick() {
+            for update in feed.drain(&self.studio) {
                 self.on_update(update);
             }
         }
@@ -877,12 +922,14 @@ impl Hub {
     }
 
     fn notify_hooks(&self, thread: &str, kind: &Value) {
+        let machine = self.machine();
         let body = json!({
-            "machine": { "id": self.machine.get("id"), "name": self.machine.get("name") },
+            "machine": { "id": machine.get("id"), "name": machine.get("name") },
             "kind": kind,
             "thread": thread,
         });
-        for (index, url) in self.hooks.iter().enumerate() {
+        let hooks = self.hooks.read().unwrap_or_else(PoisonError::into_inner).clone();
+        for (index, url) in hooks.iter().enumerate() {
             let request = self.http.post(url).json(&body);
             tokio::spawn(async move {
                 match request.send().await {
@@ -943,7 +990,7 @@ impl Hub {
             "protocol": protocol,
             "min_protocol": MIN_PROTOCOL,
             "epoch": self.epoch,
-            "machine": self.machine,
+            "machine": self.machine(),
             "device": { "id": device, "name": name },
             "resume": if delta { "delta" } else { "snapshot" },
             "seq": base,

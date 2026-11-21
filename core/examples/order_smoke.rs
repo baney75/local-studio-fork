@@ -301,6 +301,7 @@ fn main() -> anyhow::Result<()> {
         session_dir: Some(agent_dir.join("sessions").to_string_lossy().into_owned()),
         data_dir: None,
         controller_main: None,
+        take_over_serve: false,
         launch: Some(local_studio_core::DaemonLaunch { program: daemon.to_string_lossy().into_owned() }),
     };
     let outcome = first_run(config(), &work)

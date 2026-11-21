@@ -1398,6 +1398,7 @@ name = "local-studio-kit"
 version = "0.1.0"
 dependencies = [
  "local-studio-core",
+ "local-studio-remote",
  "uniffi",
 ]
 

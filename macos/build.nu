@@ -36,10 +36,14 @@ def build-kit [repo: path, package: path, profile: string] {
     let bindings = (mktemp -d)
     ^cargo run --quiet --manifest-path ($repo | path join "Cargo.toml") -p local-studio-kit --bin uniffi-bindgen ...$cargo_profile -- generate --library ($target | path join "liblocal_studio_kit.dylib") --language swift --out-dir $bindings
     rm -r -f $generated
-    mkdir ($generated | path join "lib") ($generated | path join "LocalStudioKit") ($generated | path join "local_studio_coreFFI")
-    mv ($bindings | path join "local_studio_core.swift") ($generated | path join "LocalStudioKit")
-    mv ($bindings | path join "local_studio_coreFFI.h") ($generated | path join "local_studio_coreFFI")
-    mv ($bindings | path join "local_studio_coreFFI.modulemap") ($generated | path join "local_studio_coreFFI" "module.modulemap")
+    mkdir ($generated | path join "lib") ($generated | path join "LocalStudioKit")
+    for module in ["local_studio_core" "local_studio_kit"] {
+        let ffi = ($generated | path join $"($module)FFI")
+        mkdir $ffi
+        mv ($bindings | path join $"($module).swift") ($generated | path join "LocalStudioKit")
+        mv ($bindings | path join $"($module)FFI.h") $ffi
+        mv ($bindings | path join $"($module)FFI.modulemap") ($ffi | path join "module.modulemap")
+    }
     cp ($target | path join "liblocal_studio_kit.a") ($generated | path join "lib")
     rm -r -f $bindings
 }

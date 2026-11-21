@@ -304,6 +304,7 @@ fn main() -> anyhow::Result<()> {
         session_dir: Some(agent.join("sessions").to_string_lossy().into_owned()),
         data_dir: None,
         controller_main: None,
+        take_over_serve: false,
         launch: Some(DaemonLaunch { program: daemon.to_string_lossy().into_owned() }),
     };
     let signal = Arc::new(Signal::default());

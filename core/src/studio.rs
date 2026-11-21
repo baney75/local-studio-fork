@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eukhe_client::daemon_client::{DaemonClient, DaemonClientEvent};
@@ -39,6 +39,8 @@ use crate::workspace::{PreparedWorktree, Workspace};
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+const TAKEOVER_WAIT: Duration = Duration::from_secs(15);
+const TAKEOVER_POLL: Duration = Duration::from_millis(100);
 const TIMER_PERIOD: Duration = Duration::from_secs(15);
 const EVENT_BURST: usize = 512;
 const NEW_THREAD_TITLE: &str = "New thread";
@@ -72,6 +74,8 @@ pub struct StudioConfig {
     pub data_dir: Option<String>,
     pub launch: Option<DaemonLaunch>,
     pub controller_main: Option<String>,
+    #[cfg_attr(feature = "ffi", uniffi(default = false))]
+    pub take_over_serve: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,52 +101,43 @@ pub trait Waker: Send + Sync {
     fn wake(&self);
 }
 
-pub(crate) struct Mailbox {
+#[derive(Clone, Copy)]
+enum How {
+    Plain,
+    Threads,
+    Frame,
+}
+
+struct Queue {
     updates: Mutex<Vec<Update>>,
     waker: Arc<dyn Waker>,
 }
 
-impl Mailbox {
-    pub(crate) fn push(&self, update: Update) {
+impl Queue {
+    fn new(waker: Arc<dyn Waker>) -> Self {
+        Self { updates: Mutex::new(Vec::new()), waker }
+    }
+
+    fn put(&self, update: Update, how: How) {
         let was_empty = {
             let mut updates = self.updates.lock().unwrap_or_else(PoisonError::into_inner);
             let was_empty = updates.is_empty();
-            updates.push(update);
-            was_empty
-        };
-        if was_empty {
-            self.waker.wake();
-        }
-    }
-
-    pub(crate) fn notice(&self, level: NoticeLevel, text: impl Into<String>) {
-        self.push(Update::Notice { level, text: text.into() });
-    }
-
-    fn push_threads(&self, threads: Vec<ThreadRow>) {
-        let was_empty = {
-            let mut updates = self.updates.lock().unwrap_or_else(PoisonError::into_inner);
-            updates.retain(|update| !matches!(update, Update::Threads { .. }));
-            let was_empty = updates.is_empty();
-            updates.push(Update::Threads { threads });
-            was_empty
-        };
-        if was_empty {
-            self.waker.wake();
-        }
-    }
-
-    pub(crate) fn push_frame(&self, terminal: &str, frame: TerminalFrame) {
-        let was_empty = {
-            let mut updates = self.updates.lock().unwrap_or_else(PoisonError::into_inner);
-            let was_empty = updates.is_empty();
-            let pending = updates.iter_mut().rev().find_map(|update| match update {
-                Update::TerminalFrame { terminal: id, frame } if id == terminal => Some(frame),
-                _ => None,
-            });
-            match pending {
-                Some(pending) => merge_frame(pending, frame),
-                None => updates.push(Update::TerminalFrame { terminal: terminal.to_owned(), frame }),
+            match (how, update) {
+                (How::Threads, update) => {
+                    updates.retain(|update| !matches!(update, Update::Threads { .. }));
+                    updates.push(update);
+                }
+                (How::Frame, Update::TerminalFrame { terminal, frame }) => {
+                    let pending = updates.iter_mut().rev().find_map(|update| match update {
+                        Update::TerminalFrame { terminal: id, frame } if *id == terminal => Some(frame),
+                        _ => None,
+                    });
+                    match pending {
+                        Some(pending) => merge_frame(pending, frame),
+                        None => updates.push(Update::TerminalFrame { terminal, frame }),
+                    }
+                }
+                (_, update) => updates.push(update),
             }
             was_empty
         };
@@ -153,6 +148,89 @@ impl Mailbox {
 
     fn drain(&self) -> Vec<Update> {
         std::mem::take(&mut *self.updates.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+}
+
+#[derive(Default)]
+struct Taps {
+    latest: Vec<Update>,
+    feeds: Vec<Weak<Queue>>,
+}
+
+fn remembered(update: &Update) -> bool {
+    matches!(
+        update,
+        Update::Connection { .. }
+            | Update::Projects { .. }
+            | Update::Threads { .. }
+            | Update::Models { .. }
+            | Update::DaemonDefault { .. }
+    )
+}
+
+pub(crate) struct Mailbox {
+    main: Queue,
+    taps: Mutex<Taps>,
+}
+
+pub struct Subscription(Arc<Queue>);
+
+impl Subscription {
+    #[must_use]
+    pub fn tick(&self) -> Vec<Update> {
+        self.0.drain()
+    }
+}
+
+impl Mailbox {
+    fn new(waker: Arc<dyn Waker>) -> Self {
+        Self { main: Queue::new(waker), taps: Mutex::new(Taps::default()) }
+    }
+
+    fn deliver(&self, update: Update, how: How) {
+        {
+            let mut taps = self.taps.lock().unwrap_or_else(PoisonError::into_inner);
+            if remembered(&update) {
+                let kind = std::mem::discriminant(&update);
+                taps.latest.retain(|known| std::mem::discriminant(known) != kind);
+                taps.latest.push(update.clone());
+            }
+            taps.feeds.retain(|feed| feed.strong_count() > 0);
+            for feed in taps.feeds.iter().filter_map(Weak::upgrade) {
+                feed.put(update.clone(), how);
+            }
+        }
+        self.main.put(update, how);
+    }
+
+    pub(crate) fn push(&self, update: Update) {
+        self.deliver(update, How::Plain);
+    }
+
+    pub(crate) fn notice(&self, level: NoticeLevel, text: impl Into<String>) {
+        self.push(Update::Notice { level, text: text.into() });
+    }
+
+    fn push_threads(&self, threads: Vec<ThreadRow>) {
+        self.deliver(Update::Threads { threads }, How::Threads);
+    }
+
+    pub(crate) fn push_frame(&self, terminal: &str, frame: TerminalFrame) {
+        self.deliver(Update::TerminalFrame { terminal: terminal.to_owned(), frame }, How::Frame);
+    }
+
+    fn drain(&self) -> Vec<Update> {
+        self.main.drain()
+    }
+
+    fn subscribe(&self, waker: Arc<dyn Waker>) -> Subscription {
+        let queue = Arc::new(Queue::new(waker));
+        let mut taps = self.taps.lock().unwrap_or_else(PoisonError::into_inner);
+        for update in &taps.latest {
+            queue.put(update.clone(), How::Plain);
+        }
+        taps.feeds.push(Arc::downgrade(&queue));
+        Subscription(queue)
     }
 }
 
@@ -448,7 +526,7 @@ impl Studio {
             store::data_dir(config.data_dir.as_deref()).map_err(|message| StudioError::Config { message })?;
         std::fs::create_dir_all(&data_dir)
             .map_err(|error| StudioError::Config { message: format!("create {}: {error}", data_dir.display()) })?;
-        let lock = lock_data_dir(&data_dir)?;
+        let lock = lock_data_dir(&data_dir, config.take_over_serve)?;
         let store = Store::open(&data_dir).map_err(|error| StudioError::Config { message: format!("{error:#}") })?;
         let home = store::home_dir()
             .ok_or_else(|| StudioError::Config { message: format!("{} is not set", crate::platform::HOME_VAR) })?;
@@ -459,7 +537,7 @@ impl Studio {
             .enable_all()
             .build()
             .map_err(|error| StudioError::Runtime { message: error.to_string() })?;
-        let mailbox = Arc::new(Mailbox { updates: Mutex::new(Vec::new()), waker });
+        let mailbox = Arc::new(Mailbox::new(waker));
         let (client_slot, client_watch) = watch::channel(None);
         let query = DaemonQuery::new(client_watch.clone(), session_dir.clone());
         let home = home.to_string_lossy().into_owned();
@@ -738,27 +816,46 @@ impl Studio {
     }
 }
 
-fn lock_data_dir(data_dir: &Path) -> Result<std::fs::File, StudioError> {
-    use std::io::{Read, Seek, Write};
+fn lock_data_dir(data_dir: &Path, take_over_serve: bool) -> Result<std::fs::File, StudioError> {
+    use std::io::{Seek, Write};
     let path = data_dir.join("studio.lock");
     let failed = |error: std::io::Error| StudioError::Config { message: format!("lock {}: {error}", path.display()) };
     let mut file =
         std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path).map_err(failed)?;
-    match file.try_lock() {
-        Ok(()) => {}
-        Err(std::fs::TryLockError::WouldBlock) => {
-            let mut holder = String::new();
-            file.read_to_string(&mut holder).ok();
-            let holder = holder.trim();
-            let by = if holder.is_empty() { String::new() } else { format!(" (process {holder})") };
-            return Err(StudioError::Config {
-                message: format!(
-                    "another Local Studio{by} already owns {}: quit it, or give this one its own data dir",
-                    data_dir.display()
-                ),
-            });
+    let mut asked: Option<std::time::Instant> = None;
+    loop {
+        match file.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) => {
+                let holder = std::fs::read_to_string(&path).unwrap_or_default().trim().to_string();
+                if let Some(asked) = asked {
+                    if asked.elapsed() < TAKEOVER_WAIT {
+                        std::thread::sleep(TAKEOVER_POLL);
+                        continue;
+                    }
+                } else if take_over_serve {
+                    if let Some(pid) = holder.parse::<u32>().ok().filter(|pid| serve::runs_serve(*pid)) {
+                        if serve::hand_over(pid) {
+                            asked = Some(std::time::Instant::now());
+                            continue;
+                        }
+                    }
+                }
+                let by = if holder.is_empty() { String::new() } else { format!(" (process {holder})") };
+                let waited = if asked.is_some() {
+                    format!(" and did not hand it over within {} s", TAKEOVER_WAIT.as_secs())
+                } else {
+                    String::new()
+                };
+                return Err(StudioError::Config {
+                    message: format!(
+                        "another Local Studio{by} already owns {}{waited}: quit it, or give this one its own data dir",
+                        data_dir.display()
+                    ),
+                });
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(failed(error)),
         }
-        Err(std::fs::TryLockError::Error(error)) => return Err(failed(error)),
     }
     file.set_len(0)
         .and_then(|()| file.rewind())
@@ -767,7 +864,67 @@ fn lock_data_dir(data_dir: &Path) -> Result<std::fs::File, StudioError> {
     Ok(file)
 }
 
+#[cfg(unix)]
+mod serve {
+    use std::process::{Command, Stdio};
+
+    pub const NAME: &str = "local-studio-serve";
+
+    fn name_of(path: &str) -> String {
+        path.trim().trim_end_matches(" (deleted)").rsplit('/').next().unwrap_or_default().to_string()
+    }
+
+    pub fn executable(pid: u32) -> Option<String> {
+        if let Ok(path) = std::fs::read_link(format!("/proc/{pid}/exe")) {
+            return Some(name_of(&path.to_string_lossy()));
+        }
+        let output = Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "comm="])
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .filter(|output| output.status.success())?;
+        Some(name_of(&String::from_utf8_lossy(&output.stdout))).filter(|name| !name.is_empty())
+    }
+
+    pub fn runs_serve(pid: u32) -> bool {
+        pid != std::process::id() && executable(pid).as_deref() == Some(NAME)
+    }
+
+    pub fn hand_over(pid: u32) -> bool {
+        Command::new("kill")
+            .args(["-USR1", &pid.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+}
+
+#[cfg(not(unix))]
+mod serve {
+    pub fn executable(_: u32) -> Option<String> {
+        None
+    }
+
+    pub fn runs_serve(_: u32) -> bool {
+        false
+    }
+
+    pub fn hand_over(_: u32) -> bool {
+        false
+    }
+}
+
+#[must_use]
+pub fn process_name(pid: u32) -> Option<String> {
+    serve::executable(pid)
+}
+
 impl Studio {
+    pub fn subscribe(&self, waker: Arc<dyn Waker>) -> Subscription {
+        self.mailbox.subscribe(waker)
+    }
+
     pub fn backlog(&self) -> (usize, usize) {
         (self.backlog.prompts.load(Ordering::SeqCst), self.backlog.bytes.load(Ordering::SeqCst))
     }

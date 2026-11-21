@@ -1,8 +1,7 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
 use futures_util::stream::{SplitSink, SplitStream};
@@ -18,6 +17,7 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use serde_json::{json, Value};
 use snow::HandshakeState;
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
@@ -45,14 +45,32 @@ type Sink = SplitSink<Socket, Message>;
 type Stream = SplitStream<Socket>;
 type Reply = Response<Full<Bytes>>;
 
+pub struct Hosts {
+    pub allowed: Vec<String>,
+    pub tunnels: Vec<String>,
+}
+
 pub struct Server {
     pub hub: Arc<Hub>,
     pub devices: Devices,
     pub key: StaticKey,
     pub port: u16,
-    pub allowed: Vec<String>,
-    pub tunnels: Vec<String>,
+    pub hosts: RwLock<Hosts>,
     pub gate: Gate,
+}
+
+impl Server {
+    pub fn set_hosts(&self, hosts: Hosts) {
+        *self.hosts.write().unwrap_or_else(PoisonError::into_inner) = hosts;
+    }
+
+    fn host_allowed(&self, host: &str, route: Route) -> bool {
+        let hosts = self.hosts.read().unwrap_or_else(PoisonError::into_inner);
+        match route {
+            Route::Local => access::host_allowed(host, self.port, &hosts.allowed),
+            Route::Tunnel => access::named(host, &hosts.tunnels),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,21 +79,11 @@ pub enum Route {
     Tunnel,
 }
 
-async fn accept(listener: Option<&TcpListener>) -> std::io::Result<(tokio::net::TcpStream, SocketAddr)> {
-    match listener {
-        Some(listener) => listener.accept().await,
-        None => std::future::pending().await,
-    }
-}
-
-pub async fn run(local: TcpListener, tunnel: Option<TcpListener>, server: Arc<Server>, stop: impl Future<Output = ()>) {
-    tokio::spawn(revocations(Arc::clone(&server)));
-    tokio::pin!(stop);
+pub async fn listen(listener: TcpListener, route: Route, server: Arc<Server>, mut stop: watch::Receiver<bool>) {
     loop {
-        let (accepted, route) = tokio::select! {
-            () = &mut stop => return,
-            accepted = local.accept() => (accepted, Route::Local),
-            accepted = accept(tunnel.as_ref()) => (accepted, Route::Tunnel),
+        let accepted = tokio::select! {
+            _ = stop.wait_for(|stopped| *stopped) => return,
+            accepted = listener.accept() => accepted,
         };
         let (stream, peer) = match accepted {
             Ok(accepted) => accepted,
@@ -102,7 +110,7 @@ pub async fn run(local: TcpListener, tunnel: Option<TcpListener>, server: Arc<Se
     }
 }
 
-async fn revocations(server: Arc<Server>) {
+pub async fn revocations(server: Arc<Server>) {
     let mut every = tokio::time::interval(REVOKE_POLL);
     loop {
         every.tick().await;
@@ -129,11 +137,7 @@ fn header(headers: &HeaderMap, name: impl header::AsHeaderName) -> Option<&str> 
 
 fn handle(server: &Arc<Server>, mut request: Request<Incoming>, peer: SocketAddr, route: Route) -> Reply {
     let host = header(request.headers(), header::HOST).unwrap_or_default().to_string();
-    let allowed = match route {
-        Route::Local => access::host_allowed(&host, server.port, &server.allowed),
-        Route::Tunnel => access::named(&host, &server.tunnels),
-    };
-    if !allowed {
+    if !server.host_allowed(&host, route) {
         eprintln!(
             "local-studio-serve: refused a request from {} on the {route:?} listener for host {host:?}",
             peer.ip()

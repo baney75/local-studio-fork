@@ -11,6 +11,7 @@ publish = false
 [workspace.dependencies]
 local-studio-core = { path = "core" }
 local-studio-version = { path = "version" }
+local-studio-remote = { path = "remote" }
 eukhe-client = { git = "https://github.com/gildrb/eukhe", tag = "eukhe-v0.10.73" }
 eukhe-types = { git = "https://github.com/gildrb/eukhe", tag = "eukhe-v0.10.73" }
 anyhow = "1"

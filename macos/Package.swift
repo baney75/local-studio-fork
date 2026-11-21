@@ -14,9 +14,13 @@ let package = Package(
             name: "local_studio_coreFFI",
             path: "Generated/local_studio_coreFFI"
         ),
+        .systemLibrary(
+            name: "local_studio_kitFFI",
+            path: "Generated/local_studio_kitFFI"
+        ),
         .target(
             name: "LocalStudioKit",
-            dependencies: ["local_studio_coreFFI"],
+            dependencies: ["local_studio_coreFFI", "local_studio_kitFFI"],
             path: "Generated/LocalStudioKit",
             linkerSettings: [
                 .unsafeFlags(["-L", kitLibrary]),

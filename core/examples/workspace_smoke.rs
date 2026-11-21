@@ -497,6 +497,7 @@ fn main() -> anyhow::Result<()> {
         data_dir: None,
         launch: Some(DaemonLaunch { program: daemon.to_string_lossy().into_owned() }),
         controller_main: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../controller/src/main.ts").to_string()),
+        take_over_serve: false,
     };
     let outcome = drive(&config, &repo, port);
     let stopped = stop_daemon(&socket);
