@@ -4,6 +4,7 @@ use std::process::ExitCode;
 
 use local_studio_core::plugins::{self, Capability, Catalog, Consent, Grants, Plugin, Source};
 use local_studio_core::tunnel::{self, Cloudflared, Failure, Ports, Status, Tunnel};
+use serde_json::Value;
 
 const USAGE: &str = "usage: local-studio --version
        local-studio plugin validate <dir>
@@ -14,6 +15,10 @@ const USAGE: &str = "usage: local-studio --version
        local-studio plugin capabilities
        local-studio plugin hash <dir> [excluded path...]
        local-studio tunnel status [--json]
+       local-studio tunnel setup --cloudflare <hostname> [--alias <name>]... [--serve <port>] [--mcp <port>] [--yes] [--json]
+       local-studio tunnel setup --tailnet [--serve <port>] [--mcp <port>] [--yes] [--json]
+       local-studio tunnel adopt [--hostname <name>] [--yes] [--json]
+       local-studio tunnel off [--json]
        local-studio tunnel request [--serve <port>] [--mcp <port>] [--json]
        local-studio tunnel up [--yes] [--json]
        local-studio tunnel down | release [--json]
@@ -48,11 +53,15 @@ fn main() -> ExitCode {
             let exclude: Vec<String> = exclude.iter().map(ToString::to_string).collect();
             plugins::tree_hash(Path::new(dir), &exclude).map(|tree| println!("{tree}"))
         }
-        ["tunnel", "status"] => run_tunnel(|t| Box::pin(t.status()), json),
-        ["tunnel", "request", flags @ ..] => request_ports(flags, tunnel::DEFAULT_PORTS).and_then(|ports| {
-            run_tunnel(
-                move |t| {
-                    Box::pin(t.request(ports, option_env!("LOCAL_STUDIO_CHANNEL").unwrap_or("dev"), move |url| {
+        ["tunnel", "status"] => status(json),
+        ["tunnel", "setup", flags @ ..] => gate(json).unwrap_or_else(|| setup(flags, json)),
+        ["tunnel", "adopt", flags @ ..] => gate(json).unwrap_or_else(|| adopt(flags, json)),
+        ["tunnel", "off"] => run_state(|t| Box::pin(t.off()), json),
+        ["tunnel", "request", flags @ ..] => gate(json).unwrap_or_else(|| {
+            request_ports(flags, tunnel::DEFAULT_PORTS).and_then(|ports| {
+                run_tunnel(
+                    move |t| {
+                        Box::pin(t.request(ports, local_studio_core::CHANNEL, move |url| {
                         if json {
                             println!(
                                 "{}",
@@ -64,9 +73,10 @@ fn main() -> ExitCode {
                         let _ = std::io::stdout().flush();
                         open_browser(url);
                     }))
-                },
-                json,
-            )
+                    },
+                    json,
+                )
+            })
         }),
         ["tunnel", "up"] => run_tunnel(|t| Box::pin(t.up(consent(false, json))), json),
         ["tunnel", "up", "--yes"] => run_tunnel(|t| Box::pin(t.up(consent(true, json))), json),
@@ -280,6 +290,109 @@ fn run_tunnel(call: impl for<'a> FnOnce(&'a Tunnel) -> TunnelCall<'a>, as_json: 
         println!("  released on {at} if left down");
     }
     Ok(())
+}
+
+type StateCall<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, Failure>> + 'a>>;
+
+fn gate(as_json: bool) -> Option<Result<(), String>> {
+    let value = tunnel::waitlist(local_studio_core::CHANNEL, tunnel::platform())?;
+    show(&value, as_json);
+    Some(Ok(()))
+}
+
+fn status(as_json: bool) -> Result<(), String> {
+    if let Some(value) = tunnel::waitlist(local_studio_core::CHANNEL, tunnel::platform()) {
+        let tunnel = Tunnel::open(None).map_err(|error| failed(&error.into(), as_json))?;
+        if tunnel.is_unset() {
+            show(&value, as_json);
+            return Ok(());
+        }
+    }
+    run_tunnel(|t| Box::pin(t.status()), as_json)
+}
+
+fn show(value: &Value, as_json: bool) {
+    if as_json {
+        println!("{value}");
+        return;
+    }
+    let text = |key: &str| value.get(key).and_then(Value::as_str);
+    println!("{}: {}", text("state").unwrap_or("error"), text("message").unwrap_or(""));
+    for step in value.get("plan").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
+        println!("  - {step}");
+    }
+    for (key, label) in [("command", "run"), ("url", "open"), ("mcpUrl", "MCP address"), ("wsUrl", "phone address")] {
+        if let Some(found) = text(key) {
+            println!("  {label}: {found}");
+        }
+    }
+}
+
+fn run_state(call: impl for<'a> FnOnce(&'a Tunnel) -> StateCall<'a>, as_json: bool) -> Result<(), String> {
+    let tunnel = Tunnel::open(None).map_err(|error| failed(&error.into(), as_json))?;
+    let runtime =
+        tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|error| error.to_string())?;
+    let value = runtime.block_on(call(&tunnel)).map_err(|failure| failed(&failure, as_json))?;
+    show(&value, as_json);
+    Ok(())
+}
+
+fn port_value(value: Option<&&str>, usage: &str) -> Result<u16, String> {
+    value.and_then(|value| value.parse().ok()).ok_or_else(|| usage.to_string())
+}
+
+fn setup(flags: &[&str], json: bool) -> Result<(), String> {
+    let usage = "usage: local-studio tunnel setup (--cloudflare <hostname> [--alias <name>]... | --tailnet) [--serve <port>] [--mcp <port>] [--yes] [--json]";
+    let (mut cloudflare, mut tailnet, mut yes) = (None, false, false);
+    let (mut aliases, mut serve, mut mcp) = (Vec::new(), None, None);
+    let mut rest = flags.iter();
+    while let Some(flag) = rest.next() {
+        match *flag {
+            "--cloudflare" => cloudflare = Some(rest.next().ok_or(usage)?.to_string()),
+            "--alias" => aliases.push(rest.next().ok_or(usage)?.to_string()),
+            "--tailnet" => tailnet = true,
+            "--yes" => yes = true,
+            "--serve" => serve = Some(port_value(rest.next(), usage)?),
+            "--mcp" => mcp = Some(port_value(rest.next(), usage)?),
+            _ => return Err(usage.to_string()),
+        }
+    }
+    match (cloudflare, tailnet) {
+        (Some(host), false) => {
+            run_state(move |t| Box::pin(t.setup_cloudflare(host, aliases, serve, mcp, consent(yes, json))), json)
+        }
+        (None, true) if aliases.is_empty() => run_state(move |t| Box::pin(t.setup_tailnet(serve, mcp)), json),
+        _ => Err(usage.to_string()),
+    }
+}
+
+fn adopt(flags: &[&str], json: bool) -> Result<(), String> {
+    let usage = "usage: local-studio tunnel adopt [--hostname <name>] [--yes] [--json]";
+    let (mut hostname, mut yes) = (None, false);
+    let mut rest = flags.iter();
+    while let Some(flag) = rest.next() {
+        match *flag {
+            "--hostname" => hostname = Some(rest.next().ok_or(usage)?.to_string()),
+            "--yes" => yes = true,
+            _ => return Err(usage.to_string()),
+        }
+    }
+    let go = move |plan: &Value| {
+        if yes {
+            return true;
+        }
+        if json || !std::io::stdin().is_terminal() {
+            return false;
+        }
+        for step in plan.get("plan").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
+            println!("  - {step}");
+        }
+        print!("Adopt Tychicus's tunnel this way? [y/N] ");
+        let _ = std::io::stdout().flush();
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer).is_ok() && matches!(answer.trim(), "y" | "Y" | "yes" | "Yes")
+    };
+    run_state(move |t| Box::pin(t.adopt(hostname, go, consent(yes, json))), json)
 }
 
 fn request_ports(flags: &[&str], mut ports: Ports) -> Result<Ports, String> {

@@ -18,6 +18,13 @@ use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::platform::Mode;
 
+mod setup;
+
+pub use setup::{
+    ingress, normalize_host, path_ports, platform, tailnet_mounts, tailnet_off, tailnet_on, waitlist, MCP_PATHS,
+    SERVE_PATHS, SERVICE_LABEL, SERVICE_UNIT, TAILNET_SERVE_PORT, WAITLIST_URL,
+};
+
 pub const DEFAULT_PORTS: Ports = Ports { serve: 18094, mcp: 8787 };
 const CONTROLLER_PORT: u16 = 18091;
 pub const CLOUDFLARED_VERSION: &str = "2026.10.7";
@@ -1171,7 +1178,7 @@ fn route_status(route: &Route) -> Status {
 }
 
 fn serve_allow(hostname: &str) -> bool {
-    Command::new("local-studio-serve")
+    Command::new(setup::serve_program())
         .args(["allow-tunnel-host", hostname])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
