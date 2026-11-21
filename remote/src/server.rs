@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
@@ -57,6 +58,29 @@ pub struct Server {
     pub port: u16,
     pub hosts: RwLock<Hosts>,
     pub gate: Gate,
+    pub sockets: Sockets,
+}
+
+#[derive(Default)]
+pub struct Sockets(AtomicUsize);
+
+struct Open<'a>(&'a Sockets);
+
+impl Sockets {
+    fn enter(&self) -> Open<'_> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Open(self)
+    }
+
+    pub fn open(&self) -> usize {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for Open<'_> {
+    fn drop(&mut self) {
+        self.0 .0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Server {
@@ -517,6 +541,7 @@ async fn attached(
     protocol: u64,
     address: Client,
 ) {
+    let _open = server.sockets.enter();
     let channel = Arc::new(opened.channel);
     let said = |key: &str| hello.pointer(&format!("/device/{key}")).and_then(Value::as_str);
     if let Err(error) = server.devices.seen(&opened.device, said("name"), said("app"), said("channel")) {

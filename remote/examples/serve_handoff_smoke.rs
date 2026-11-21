@@ -628,18 +628,18 @@ async fn tunnel_live(run: &mut Run, phone: &Phone, link: Link) -> anyhow::Result
 async fn takeover(run: &mut Run, phone: &Phone, mut link: Link) -> anyhow::Result<Link> {
     let serve = run.serve_pid()?;
     let second = run.start_app("second app")?;
-    let took = run.ready(second, "second app", TAKEOVER).await?;
+    let (took, code) = tokio::join!(run.ready(second, "second app", TAKEOVER), link.closed(QUICK));
+    let took = took?;
     ensure!(took <= TAKEOVER, "the takeover took {:.1} s", took.as_secs_f64());
     let app = run.app_pid(second)?;
     ensure!(owner(&run.data) == Some(app), "the second app started without owning the lock");
     println!("ok   a take_over_serve Studio got the lock from serve {serve} in {:.2} s", took.as_secs_f64());
     run.report.push(format!("takeover from serve to the app: {:.2} s", took.as_secs_f64()));
-    let code = link.closed(QUICK).await?;
+    let code = code?;
     ensure!(code == Some(1012), "the phone was closed with {code:?}, expected 1012");
     println!("ok   the paired phone's socket was closed with 1012");
     ensure!(run.serve_alive()?, "serve exited on SIGUSR1:\n{}", run.serve_log());
-    let log = run.serve_log();
-    ensure!(log.contains("SIGUSR1: released"), "serve did not log the handover:\n{log}");
+    until("serve logs the handover", QUICK, || Ok(run.serve_log().contains("SIGUSR1: released"))).await?;
     let (link, hello) = reconnect(run.port, phone, "to the in-process server").await?;
     ensure!(owner(&run.data) == Some(app), "the lock left the app while the phone reconnected");
     let wanted = format!("wss://{TUNNEL}/v1/ws");
@@ -663,8 +663,9 @@ async fn takeover(run: &mut Run, phone: &Phone, mut link: Link) -> anyhow::Resul
 
 async fn hand_back(run: &mut Run, phone: &Phone, mut link: Link) -> anyhow::Result<Link> {
     let serve = run.serve_pid()?;
-    let quit = run.quit_app(1).await?;
-    let code = link.closed(QUICK).await?;
+    let (quit, code) = tokio::join!(run.quit_app(1), link.closed(QUICK));
+    let quit = quit?;
+    let code = code?;
     ensure!(code == Some(1012), "the app's quit closed the phone with {code:?}, expected 1012");
     println!("ok   the app's quit closed the phone with 1012");
     let left = BACK.checked_sub(quit.elapsed()).unwrap_or_default();
@@ -802,8 +803,9 @@ async fn drive(run: &mut Run) -> anyhow::Result<()> {
     let link = takeover(run, &phone, link).await?;
     let mut link = hand_back(run, &phone, link).await?;
     tunnel_removed(run).await?;
-    run.stop_serve()?;
+    Command::new("kill").args(["-TERM", &run.serve_pid()?.to_string()]).status()?;
     let code = link.closed(QUICK).await?;
+    run.stop_serve()?;
     ensure!(code == Some(1001), "serve's stop closed the phone with {code:?}, expected 1001");
     println!("ok   serve's stop closed the phone with 1001");
     default_tunnel_port(run)?;

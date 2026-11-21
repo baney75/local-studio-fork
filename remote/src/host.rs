@@ -19,7 +19,7 @@ use crate::{CHANNEL, VERSION};
 const BIND_WAIT: Duration = Duration::from_secs(10);
 const BIND_RETRY: Duration = Duration::from_millis(200);
 const RELOAD_EVERY: Duration = Duration::from_secs(2);
-const CLOSE_GRACE: Duration = Duration::from_millis(300);
+const DRAIN_POLL: Duration = Duration::from_millis(20);
 const STOP_WITHIN: Duration = Duration::from_secs(2);
 const GOING_AWAY: u16 = 1001;
 const RESTARTING: u16 = 1012;
@@ -116,6 +116,7 @@ pub(crate) async fn run(launch: Launch, until: impl Future<Output = Stop>) -> an
         port: config.port,
         hosts: RwLock::new(hosts_of(&config)),
         gate: Gate::default(),
+        sockets: server::Sockets::default(),
     });
     tokio::spawn(server::revocations(Arc::clone(&server)));
     let (stopping, stopped) = watch::channel(false);
@@ -134,7 +135,10 @@ pub(crate) async fn run(launch: Launch, until: impl Future<Output = Stop>) -> an
         Stop::HandOver => (RESTARTING, "service restart"),
     };
     hub.close_all(code, reason);
-    tokio::time::sleep(CLOSE_GRACE).await;
+    let deadline = tokio::time::Instant::now() + STOP_WITHIN;
+    while server.sockets.open() > 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(DRAIN_POLL).await;
+    }
     eprintln!("local-studio-serve: closed every remote socket with {code} ({reason})");
     Ok(stop)
 }
