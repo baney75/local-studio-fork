@@ -2213,6 +2213,7 @@ fn text_backlog(run: &Run) -> anyhow::Result<()> {
         data_dir: Some(root.join("data").to_string_lossy().into_owned()),
         launch: None,
         controller_main: None,
+        take_over_serve: false,
     };
     let counted = tokio::task::block_in_place(|| -> anyhow::Result<(usize, usize)> {
         let studio = Studio::new(config, Arc::new(Signal::default()) as Arc<dyn Waker>)
