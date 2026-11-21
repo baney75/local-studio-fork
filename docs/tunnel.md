@@ -52,7 +52,7 @@ Once the service runs, setup registers each hostname with `local-studio-serve al
 
 ### Tailnet
 
-`setup --tailnet` reads `tailscale status --json` (not running or signed out answers `needs_signin`, with Tailscale's sign-in URL when it gives one) and mounts each of the eleven paths on https 443 with `tailscale serve --bg --yes --https=443 --set-path=<path> http://127.0.0.1:<port><path>`: `/v1` paths to the local listener (18093), the rest to `ports.mcp`. It never runs Funnel, and refuses, changing nothing, when Funnel is on for 443, 443 forwards raw TCP, or a path already goes somewhere else. It records the paths it added in `<data dir>/tunnel/tailnet.json`; `off` removes exactly those. route.json carries `ports.serve` 18093 on this route.
+`setup --tailnet` reads `tailscale status --json` (not running or signed out answers `needs_signin`, with Tailscale's sign-in URL when it gives one) and mounts each of the eleven paths on https 443 with `tailscale serve --bg --yes --https=443 --set-path=<path> http://127.0.0.1:<port><path>`: `/v1` paths to the local listener (18093), the rest to `ports.mcp`. It never runs Funnel, and refuses, changing nothing, when Funnel is on for 443, 443 forwards raw TCP, or a path already goes somewhere else. It records the paths it added in `<data dir>/tunnel/tailnet.json`; `off` removes exactly those. route.json carries `ports.serve` 18093 on this route. Then it runs `local-studio-serve allow-host <name> --json` so the local listener answers the tailnet name, and checks `/v1/health` and `/mcp` on that name. When that local-studio-serve has no `allow-host` yet, setup still finishes the rest, skips the health check (`checks.health` is `unchecked`), writes route.json, and answers `needs_serve_allow_host` with that command as `next`.
 
 ### Adopting a Tychicus tunnel
 
@@ -70,7 +70,7 @@ Donovan, 2026-11-21: tunnel setup ships on the dev channel only (docs/channels.m
 
 ### Agents can run it
 
-An agent must be able to set a tunnel up for a person. Every `tunnel` command takes `--json`, never prompts when stdin isn't a terminal, and returns one state with the next step: `ready`, `needs_signin` (the person signs in to Cloudflare or Tailscale; the state carries the URL or the command), `needs_dns`, `confirm` (adopt's plan, waiting for `--yes`), `needs_tychicus_join`, `off`, `waitlist` (stable or nightly; carries the signup URL), or `error` with a code (exit 1). On stable and nightly, `status` with no route and no hosted request also answers `waitlist`. `--yes` accepts the steps that change the machine, such as adopting a Tychicus tunnel. Signing in stays with the person: an agent hands over the URL and polls `status --json`.
+An agent must be able to set a tunnel up for a person. Every `tunnel` command takes `--json`, never prompts when stdin isn't a terminal, and returns one state with the next step: `ready`, `needs_signin` (the person signs in to Cloudflare or Tailscale; the state carries the URL or the command), `needs_dns`, `confirm` (adopt's plan, waiting for `--yes`), `needs_tychicus_join`, `needs_serve_allow_host` (tailnet: run the command it carries), `off`, `waitlist` (stable or nightly; carries the signup URL), or `error` with a code (exit 1). On stable and nightly, `status` with no route and no hosted request also answers `waitlist`. `--yes` accepts the steps that change the machine, such as adopting a Tychicus tunnel. Signing in stays with the person: an agent hands over the URL and polls `status --json`.
 
 ### Going live
 

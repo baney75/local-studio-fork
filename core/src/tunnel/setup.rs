@@ -830,18 +830,20 @@ impl Tunnel {
             .map_or_else(|| format!("https://{hostname}"), |base| base.trim_end_matches('/').to_string())
     }
 
-    async fn check_once(&self, hostname: &str, mcp: bool) -> Result<(), String> {
+    async fn check_once(&self, hostname: &str, mcp: bool, health: bool) -> Result<(), String> {
         let base = Self::check_base(hostname);
         let get = |path: &str| {
             self.http.get(format!("{base}{path}")).header("Host", hostname).timeout(Duration::from_secs(15)).send()
         };
-        let health = get("/v1/health").await.map_err(|error| format!("https://{hostname}/v1/health: {error}"))?;
-        let code = health.status().as_u16();
-        let ok = code == 200
-            && health.json::<Value>().await.ok().and_then(|value| value.get("ok").and_then(Value::as_bool))
-                == Some(true);
-        if !ok {
-            return Err(format!("https://{hostname}/v1/health answered {code}, not 200 from local-studio-serve."));
+        if health {
+            let answer = get("/v1/health").await.map_err(|error| format!("https://{hostname}/v1/health: {error}"))?;
+            let code = answer.status().as_u16();
+            let ok = code == 200
+                && answer.json::<Value>().await.ok().and_then(|value| value.get("ok").and_then(Value::as_bool))
+                    == Some(true);
+            if !ok {
+                return Err(format!("https://{hostname}/v1/health answered {code}, not 200 from local-studio-serve."));
+            }
         }
         if mcp {
             let answer = get("/mcp").await.map_err(|error| format!("https://{hostname}/mcp: {error}"))?;
@@ -857,14 +859,14 @@ impl Tunnel {
         Ok(())
     }
 
-    async fn public_checks(&self, hostnames: &[String], ports: Ports) -> Result<Value, String> {
+    async fn public_checks(&self, hostnames: &[String], ports: Ports, health: bool) -> Result<Value, String> {
         let mcp = listening(ports.mcp);
         for hostname in hostnames {
             let mut last = String::new();
             let mut passed = false;
             for wait in CHECK_WAITS {
                 tokio::time::sleep(Duration::from_secs(wait)).await;
-                match self.check_once(hostname, mcp).await {
+                match self.check_once(hostname, mcp, health).await {
                     Ok(()) => {
                         passed = true;
                         break;
@@ -876,7 +878,9 @@ impl Tunnel {
                 return Err(last);
             }
         }
-        Ok(json!({ "health": "ok", "mcp": if mcp { "ok" } else { "not_listening" } }))
+        Ok(
+            json!({ "health": if health { "ok" } else { "unchecked" }, "mcp": if mcp { "ok" } else { "not_listening" } }),
+        )
     }
 
     #[must_use]
@@ -945,7 +949,7 @@ impl Tunnel {
             ));
         }
         let allowed: Vec<bool> = hostnames.iter().map(|name| serve_allow(name)).collect();
-        match self.public_checks(hostnames, ports).await {
+        match self.public_checks(hostnames, ports, true).await {
             Ok(mut checks) => {
                 checks["serveAllowed"] = json!(allowed.iter().all(|ok| *ok));
                 Ok(checks)
@@ -1076,38 +1080,7 @@ impl Tunnel {
         }
         let wanted = tailnet_mounts(ports);
         let add = plan_mounts(&serve_state(&read.stdout, &dns)?, &wanted)?;
-        let mut added: Vec<(String, String)> = Vec::new();
-        let mut problem = None;
-        for (path, target) in &add {
-            match run(&bin, &tailnet_on(path, target)).await {
-                Ok(out) if out.ok() => added.push((path.clone(), target.clone())),
-                Ok(out) => {
-                    problem = Some(format!("tailscale serve couldn't mount {path}: {}", out.text()));
-                    break;
-                }
-                Err(error) => {
-                    problem = Some(error);
-                    break;
-                }
-            }
-        }
-        if problem.is_none() {
-            let after = run(&bin, &argv(&["serve", "status", "--json"])).await?;
-            match serve_state(&after.stdout, &dns) {
-                Ok(state) if state.funnel => problem = Some("Funnel came on for port 443.".into()),
-                Ok(state) => {
-                    let wrong: Vec<&str> = wanted
-                        .iter()
-                        .filter(|(path, target)| state.handlers.get(path) != Some(&Some(target.clone())))
-                        .map(|(path, _)| path.as_str())
-                        .collect();
-                    if !wrong.is_empty() {
-                        problem = Some(format!("tailscale serve doesn't send {} where it should.", wrong.join(", ")));
-                    }
-                }
-                Err(error) => problem = Some(error),
-            }
-        }
+        let (added, problem) = tailnet_mount(&bin, &dns, &wanted, &add).await?;
         if let Some(problem) = problem {
             let left = self.unmount(&bin, &added).await;
             return Err(fail("tailnet", format!("{problem} {}", undo_note(&left))).into());
@@ -1119,8 +1092,8 @@ impl Tunnel {
             }
         }
         self.save_tailnet_record(&record)?;
-        let allowed = serve_allow(&dns);
-        let mut checks = match self.public_checks(std::slice::from_ref(&dns), ports).await {
+        let allowed = allow_host(&dns).await;
+        let checks = match self.public_checks(std::slice::from_ref(&dns), ports, allowed.is_ok()).await {
             Ok(checks) => checks,
             Err(error) => {
                 let left = self.unmount(&bin, &added).await;
@@ -1130,11 +1103,19 @@ impl Tunnel {
                 return Err(fail("going_live", format!("{error} {}", undo_note(&left))).into());
             }
         };
-        checks["serveAllowed"] = json!(allowed);
         let route = new_route("tailnet", &dns, &[], ports);
         self.write_route(&route)?;
         let mut value = ready(&route, &checks, "Live on your tailnet only. No Funnel.");
         value["mounted"] = json!(added.iter().map(|(path, _)| path).collect::<Vec<_>>());
+        if let Err(why) = allowed {
+            let command = format!("local-studio-serve allow-host {dns} --json");
+            value["state"] = json!("needs_serve_allow_host");
+            value["next"] = json!(command);
+            value["command"] = json!(command);
+            value["message"] = json!(format!(
+                "The tailnet paths are up, but local-studio-serve hasn't allowed {dns} on its local listener, so the phone path isn't checked yet. Update local-studio-serve, then run: {command} ({why})"
+            ));
+        }
         Ok(value)
     }
 
@@ -1345,7 +1326,7 @@ impl Tunnel {
         if was_running {
             manager.stop(TYCHICUS).await?;
             *stopped = true;
-            self.public_checks(names, ports)
+            self.public_checks(names, ports, true)
                 .await
                 .map_err(|error| format!("After Tychicus's tunnel stopped: {error}"))?;
         }
@@ -1419,6 +1400,55 @@ impl Tunnel {
     }
 }
 
+async fn tailnet_mount(
+    bin: &Path,
+    dns: &str,
+    wanted: &[(String, String)],
+    add: &[(String, String)],
+) -> Result<(Vec<(String, String)>, Option<String>), Failure> {
+    let mut added: Vec<(String, String)> = Vec::new();
+    let mut problem = None;
+    for (path, target) in add {
+        match run(bin, &tailnet_on(path, target)).await {
+            Ok(out) if out.ok() => added.push((path.clone(), target.clone())),
+            Ok(out) => {
+                problem = Some(format!("tailscale serve couldn't mount {path}: {}", out.text()));
+                break;
+            }
+            Err(error) => {
+                problem = Some(error);
+                break;
+            }
+        }
+    }
+    if problem.is_none() {
+        let after = run(bin, &argv(&["serve", "status", "--json"])).await?;
+        match serve_state(&after.stdout, dns) {
+            Ok(state) if state.funnel => problem = Some("Funnel came on for port 443.".into()),
+            Ok(state) => {
+                let wrong: Vec<&str> = wanted
+                    .iter()
+                    .filter(|(path, target)| state.handlers.get(path) != Some(&Some(target.clone())))
+                    .map(|(path, _)| path.as_str())
+                    .collect();
+                if !wrong.is_empty() {
+                    problem = Some(format!("tailscale serve doesn't send {} where it should.", wrong.join(", ")));
+                }
+            }
+            Err(error) => problem = Some(error),
+        }
+    }
+    Ok((added, problem))
+}
+
+async fn allow_host(hostname: &str) -> Result<(), String> {
+    let out = run(&serve_program(), &argv(&["allow-host", hostname, "--json"])).await?;
+    if out.ok() {
+        return Ok(());
+    }
+    Err(format!("local-studio-serve allow-host exited {}: {}", out.code, out.text()))
+}
+
 fn undo_note(left: &[String]) -> String {
     if left.is_empty() {
         "The tailnet paths this run added were removed.".to_string()
@@ -1441,192 +1471,4 @@ async fn join_tychicus() -> Result<(), String> {
         .and_then(|value| value.get("message").and_then(Value::as_str).map(ToString::to_string))
         .unwrap_or_else(|| out.text());
     Err(format!("tychicus remote join exited {}: {said}", out.code))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_real_service_manager_needs_the_real_home_and_a_stand_in_needs_another() {
-        let real = Path::new("/Users/someone");
-        let scratch = Path::new("/tmp/scratch/home");
-        assert!(service_guard("launchctl", true, real, Some(real)).is_ok());
-        assert!(service_guard("launchctl", false, scratch, Some(real)).is_ok());
-        for (is_real, home, account) in
-            [(true, scratch, Some(real)), (false, real, Some(real)), (true, real, None), (false, scratch, None)]
-        {
-            let refused = service_guard("launchctl", is_real, home, account).err().map(|f| f.code);
-            assert_eq!(refused.as_deref(), Some("unsafe_service_path"), "{is_real} {home:?} {account:?}");
-        }
-    }
-
-    #[test]
-    fn service_files_stay_in_the_home_service_folders() {
-        let home = Path::new("/tmp/scratch/home");
-        let agents = home.join("Library").join("LaunchAgents");
-        let units = home.join(".config").join("systemd").join("user");
-        let managers = [
-            Manager::Launchd { launchctl: PathBuf::from("x"), domain: "gui/501".into(), agents: agents.clone() },
-            Manager::Systemd { systemctl: PathBuf::from("x"), units: units.clone() },
-        ];
-        for manager in &managers {
-            for service in [OWN, TYCHICUS] {
-                let file = manager.file(service);
-                let parent = file.parent().map(Path::to_path_buf).unwrap_or_default();
-                assert!(parent == agents || parent == units, "{}", file.display());
-                assert!(file.file_name().is_some_and(|name| {
-                    let name = name.to_string_lossy();
-                    name == format!("{}.plist", service.label) || name == service.unit
-                }));
-            }
-        }
-    }
-
-    #[test]
-    fn only_dev_opens_setup() {
-        assert!(waitlist("dev", "macos").is_none());
-        for channel in ["stable", "nightly"] {
-            for os in ["macos", "linux", "windows"] {
-                let Some(value) = waitlist(channel, os) else { panic!("{channel} must be gated") };
-                assert_eq!(value["state"], "waitlist");
-                assert_eq!(value["next"], "waitlist");
-                assert_eq!(value["channel"], channel);
-                assert_eq!(value["url"], format!("{WAITLIST_URL}?channel={channel}&platform={os}"));
-            }
-        }
-        assert!(waitlist("", "linux").is_some());
-    }
-
-    #[test]
-    fn ingress_has_the_eleven_anchored_paths_then_404() {
-        let hosts = vec!["studio.example.com".to_string(), "old.example.com".to_string()];
-        let text = ingress(
-            "7d3c9a52-1b2e-4f60-9c1d-2a3b4c5d6e7f",
-            Path::new("/h/.cloudflared/x.json"),
-            &hosts,
-            Ports { serve: 18094, mcp: 8787 },
-        );
-        let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines[0], "tunnel: 7d3c9a52-1b2e-4f60-9c1d-2a3b4c5d6e7f");
-        assert_eq!(lines[1], "credentials-file: '/h/.cloudflared/x.json'");
-        assert_eq!(lines[2], "no-autoupdate: true");
-        assert_eq!(lines[3], "ingress:");
-        assert_eq!(lines.last().copied(), Some("  - service: http_status:404"));
-        let rules = &lines[4..lines.len() - 1];
-        assert_eq!(rules.len(), 11 * 2 * 3);
-        let mut seen = Vec::new();
-        for rule in rules.chunks(3) {
-            let host = rule[0].strip_prefix("  - hostname: ").unwrap_or_default();
-            let path =
-                rule[1].strip_prefix("    path: '^").and_then(|rest| rest.strip_suffix("$'")).unwrap_or_default();
-            let service = rule[2].strip_prefix("    service: http://127.0.0.1:").unwrap_or_default();
-            let plain = path.replace("\\.", ".");
-            let want = if SERVE_PATHS.contains(&plain.as_str()) { "18094" } else { "8787" };
-            assert!(MCP_PATHS.contains(&plain.as_str()) || SERVE_PATHS.contains(&plain.as_str()), "{plain}");
-            assert!(!path.contains("..") && !plain.contains('\\'), "{path}");
-            assert_eq!(service, want, "{plain}");
-            seen.push((host.to_string(), plain));
-        }
-        for host in &hosts {
-            let mut paths: Vec<&str> = seen.iter().filter(|(h, _)| h == host).map(|(_, p)| p.as_str()).collect();
-            paths.sort_unstable();
-            let mut want: Vec<&str> = SERVE_PATHS.iter().chain(MCP_PATHS.iter()).copied().collect();
-            want.sort_unstable();
-            assert_eq!(paths, want);
-        }
-        assert_eq!(text.matches("service:").count(), 11 * 2 + 1);
-        assert!(text.contains("path: '^/\\.well-known/oauth-protected-resource$'"));
-    }
-
-    #[test]
-    fn tailnet_maps_each_path_to_its_port_and_never_funnel() {
-        let ports = Ports { serve: TAILNET_SERVE_PORT, mcp: 8787 };
-        let mounts = tailnet_mounts(ports);
-        assert_eq!(mounts.len(), 11);
-        for (path, target) in &mounts {
-            let port = if SERVE_PATHS.contains(&path.as_str()) { 18093 } else { 8787 };
-            assert_eq!(target, &format!("http://127.0.0.1:{port}{path}"));
-            let on = tailnet_on(path, target);
-            assert_eq!(on, ["serve", "--bg", "--yes", "--https=443", &format!("--set-path={path}"), target.as_str()]);
-            let off = tailnet_off(path);
-            assert_eq!(off, ["serve", "--https=443", &format!("--set-path={path}"), "off"]);
-            assert!(on.iter().chain(off.iter()).all(|arg| !arg.to_lowercase().contains("funnel")));
-        }
-    }
-
-    #[test]
-    fn mounts_refuse_funnel_and_foreign_paths() -> Result<(), String> {
-        let dns = "studio-mac.tail1234.ts.net";
-        let wanted = tailnet_mounts(Ports { serve: TAILNET_SERVE_PORT, mcp: 8787 });
-        let empty = serve_state("", dns)?;
-        assert_eq!(plan_mounts(&empty, &wanted).map_err(|f| f.message)?.len(), 11);
-        let funnel = serve_state(r#"{"AllowFunnel":{"studio-mac.tail1234.ts.net:443":true}}"#, dns)?;
-        assert_eq!(plan_mounts(&funnel, &wanted).err().map(|f| f.code), Some("tailnet_funnel".into()));
-        let foreign = serve_state(
-            r#"{"Web":{"studio-mac.tail1234.ts.net:443":{"Handlers":{"/mcp":{"Proxy":"http://127.0.0.1:9999/mcp"},"/token":{"Proxy":"http://127.0.0.1:8787/token"}}}}}"#,
-            dns,
-        )?;
-        assert_eq!(plan_mounts(&foreign, &wanted).err().map(|f| f.code), Some("tailnet_path".into()));
-        let ours = serve_state(
-            r#"{"Web":{"studio-mac.tail1234.ts.net:443":{"Handlers":{"/token":{"Proxy":"http://127.0.0.1:8787/token"}}}}}"#,
-            dns,
-        )?;
-        assert_eq!(plan_mounts(&ours, &wanted).map_err(|f| f.message)?.len(), 10);
-        Ok(())
-    }
-
-    #[test]
-    fn route_record_shape_and_mode() -> Result<(), String> {
-        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?;
-        let root = std::env::temp_dir().join(format!("ls-route-test-{}-{}", std::process::id(), stamp.as_nanos()));
-        let tunnel = Tunnel::open(Some(&root.display().to_string()))?;
-        let route = new_route("cloudflare", "studio.example.com", &["old.example.com".into()], DEFAULT_PORTS);
-        tunnel.write_route(&route)?;
-        let path = root.join("tunnel").join("route.json");
-        let value: Value =
-            serde_json::from_slice(&fs::read(&path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-        let want = json!({
-            "v": 1, "owner": "local-studio", "route": "cloudflare", "hostname": "studio.example.com",
-            "aliases": ["old.example.com"], "ports": { "mcp": 8787, "serve": 18094 },
-        });
-        assert_eq!(value, want);
-        let empty = new_route("tailnet", "studio-mac.tail1234.ts.net", &[], Ports { serve: 18093, mcp: 8787 });
-        tunnel.write_route(&empty)?;
-        let value: Value =
-            serde_json::from_slice(&fs::read(&path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-        assert_eq!(value["aliases"], json!([]));
-        assert_eq!(value["ports"], json!({ "mcp": 8787, "serve": 18093 }));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let file = fs::metadata(&path).map_err(|e| e.to_string())?.permissions().mode() & 0o777;
-            let dir = fs::metadata(root.join("tunnel")).map_err(|e| e.to_string())?.permissions().mode() & 0o777;
-            assert_eq!((file, dir), (0o600, 0o700));
-        }
-        fs::remove_dir_all(&root).map_err(|e| e.to_string())?;
-        Ok(())
-    }
-
-    #[test]
-    fn hostnames_are_checked_before_they_reach_yaml() {
-        assert_eq!(normalize_host("https://Studio.Example.com/mcp").as_deref(), Some("studio.example.com"));
-        assert_eq!(normalize_host("studio.example.com.").as_deref(), Some("studio.example.com"));
-        for bad in
-            ["studio", "a b.example.com", "x.example.com\n  - service: http://evil", "-a.example.com", "a..b.com"]
-        {
-            assert!(normalize_host(bad).is_none(), "{bad}");
-        }
-    }
-
-    #[test]
-    fn tychicus_yml_fields() {
-        let yml = "tunnel: 7D3C9A52-1b2e-4f60-9c1d-2a3b4c5d6e7f\ncredentials-file: /h/.cloudflared/7d3c9a52-1b2e-4f60-9c1d-2a3b4c5d6e7f.json\nno-autoupdate: true\ningress:\n  - hostname: old.example.com\n    service: http://127.0.0.1:8787\n  - service: http_status:404\n";
-        assert_eq!(yml_field(yml, "tunnel").as_deref(), Some("7D3C9A52-1b2e-4f60-9c1d-2a3b4c5d6e7f"));
-        assert_eq!(yml_field(yml, "hostname").as_deref(), Some("old.example.com"));
-        assert_eq!(
-            find_uuid("Created tunnel x with id 7d3c9a52-1b2e-4f60-9c1d-2a3b4c5d6e7f").as_deref(),
-            Some("7d3c9a52-1b2e-4f60-9c1d-2a3b4c5d6e7f")
-        );
-    }
 }

@@ -108,8 +108,67 @@ exit 2
 
 const SERVE: &str = r#"#!/bin/sh
 echo "local-studio-serve $*" >> "$SHIM_LOG"
+if [ "$1" = allow-host ]; then
+  if [ -f "$SHIM_STATE/serve-no-allow-host" ]; then echo "usage: local-studio-serve serve | pair | devices | revoke" >&2; exit 2; fi
+  echo '{"ok":true}'
+fi
 exit 0
 "#;
+
+const SERVE_PATHS: [&str; 2] = ["/v1/health", "/v1/ws"];
+const MCP_PATHS: [&str; 9] = [
+    "/mcp",
+    "/.well-known/oauth-protected-resource",
+    "/.well-known/oauth-protected-resource/mcp",
+    "/.well-known/oauth-authorization-server",
+    "/.well-known/oauth-authorization-server/mcp",
+    "/authorize",
+    "/token",
+    "/register",
+    "/revoke",
+];
+
+fn eleven(serve: u16, mcp: u16) -> Vec<(&'static str, u16)> {
+    SERVE_PATHS.iter().map(|p| (*p, serve)).chain(MCP_PATHS.iter().map(|p| (*p, mcp))).collect()
+}
+
+fn check_ingress(yml: &str, tunnel: &str, hosts: &[&str], serve: u16, mcp: u16) -> Result<(), String> {
+    let lines: Vec<&str> = yml.lines().collect();
+    ensure(
+        lines.len() == 4 + hosts.len() * 33 + 1,
+        format!("the yml has {} lines, not {}", lines.len(), 4 + hosts.len() * 33 + 1),
+    )?;
+    ensure(lines[0] == format!("tunnel: {tunnel}"), format!("yml tunnel line: {}", lines[0]))?;
+    ensure(
+        lines[1].starts_with("credentials-file: '/") && lines[1].ends_with(".json'"),
+        format!("yml credentials line: {}", lines[1]),
+    )?;
+    ensure(lines[2] == "no-autoupdate: true" && lines[3] == "ingress:", "yml header")?;
+    ensure(lines.last() == Some(&"  - service: http_status:404"), "the yml must end in exactly one 404 rule")?;
+    let mut got: Vec<String> = lines[4..lines.len() - 1].chunks(3).map(|rule| rule.join("\n")).collect();
+    let mut want: Vec<String> = hosts
+        .iter()
+        .flat_map(|host| {
+            eleven(serve, mcp).into_iter().map(move |(path, port)| {
+                format!(
+                    "  - hostname: {host}\n    path: '^{}$'\n    service: http://127.0.0.1:{port}",
+                    path.replace('.', "\\.")
+                )
+            })
+        })
+        .collect();
+    got.sort();
+    want.sort();
+    ensure(got == want, format!("the ingress rules differ from the eleven anchored paths per hostname: {got:?}"))
+}
+
+fn check_record(s: &Smoke, want: &Value) -> Result<(), String> {
+    let route: Value =
+        serde_json::from_slice(&fs::read(s.route_path()).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    ensure(&route == want, format!("route.json {route} != {want}"))?;
+    ensure(mode(&s.route_path()) == 0o600, "route.json must be 0600")?;
+    ensure(mode(&s.data.join("tunnel")) == 0o700, "the tunnel folder must be 0700")
+}
 
 struct Smoke {
     bin: PathBuf,
@@ -380,6 +439,13 @@ fn run() -> Result<(), String> {
         closed_port,
     };
     println!("scratch: {}", smoke.root.display());
+    let version = Command::new(&smoke.bin).arg("--version").output().map_err(|e| e.to_string())?;
+    let version = String::from_utf8_lossy(&version.stdout).trim().to_string();
+    let channel = version.rsplit_once('(').map(|(_, rest)| rest.trim_end_matches(')').to_string()).unwrap_or_default();
+    println!("{version}");
+    if channel != "dev" {
+        return waitlist(&smoke, &channel);
+    }
     guard(&smoke)?;
     cloudflare(&smoke)?;
     tailnet(&smoke)?;
@@ -395,6 +461,33 @@ fn real_manager() -> &'static str {
     } else {
         "LS_SYSTEMCTL"
     }
+}
+
+fn waitlist(s: &Smoke, channel: &str) -> Result<(), String> {
+    let mark = s.mark();
+    for args in [
+        &["tunnel", "setup", "--cloudflare", "studio.example.com", "--json"][..],
+        &["tunnel", "setup", "--tailnet", "--json"][..],
+        &["tunnel", "adopt", "--yes", "--json"][..],
+        &["tunnel", "request", "--json"][..],
+        &["tunnel", "status", "--json"][..],
+    ] {
+        let (code, value) = s.ls(args)?;
+        let url = format!("https://local-studio-waitlist.magnus-b37.workers.dev/?channel={channel}&platform=");
+        ensure(
+            code == 0
+                && value["state"] == "waitlist"
+                && value["next"] == "waitlist"
+                && value["channel"] == channel
+                && value["url"].as_str().is_some_and(|u| u.starts_with(&url)),
+            format!("{} on {channel} answers waitlist: {value}", args.join(" ")),
+        )?;
+    }
+    let (code, value) = s.ls(&["tunnel", "off", "--json"])?;
+    ensure(code == 0 && value["state"] == "off", format!("off works on {channel}: {value}"))?;
+    ensure(s.since(mark).is_empty() && !s.route_path().exists(), "the gate touches nothing")?;
+    println!("ok: on {channel}, setup, adopt, request and status answer waitlist; off answers off");
+    Ok(())
 }
 
 fn guard(s: &Smoke) -> Result<(), String> {
@@ -433,6 +526,11 @@ fn contained(s: &Smoke) -> Result<(), String> {
 }
 
 fn cloudflare(s: &Smoke) -> Result<(), String> {
+    let mark = s.mark();
+    let (code, value) =
+        s.ls(&["tunnel", "setup", "--cloudflare", "x.example.com\n  - service: http://evil", "--json"])?;
+    ensure(code == 1 && value["code"] == "bad_hostname", format!("a hostname that isn't one is refused: {value}"))?;
+    ensure(s.since(mark).is_empty(), "a refused hostname touches nothing")?;
     let closed = s.closed_port.to_string();
     let args = ["tunnel", "setup", "--cloudflare", "studio.example.com", "--alias", "alt.example.com", "--json"];
     let mut first: Vec<&str> = args.to_vec();
@@ -473,18 +571,14 @@ fn cloudflare(s: &Smoke) -> Result<(), String> {
         "checks run after the service starts",
     )?;
     ensure(s.service_running(true), "Local Studio's service must be running")?;
-    let route: Value =
-        serde_json::from_slice(&fs::read(s.route_path()).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
     let want = json!({"v":1,"owner":"local-studio","route":"cloudflare","hostname":"studio.example.com","aliases":["alt.example.com"],"ports":{"mcp":s.closed_port,"serve":18094}});
-    ensure(route == want, format!("route.json {route} != {want}"))?;
+    check_record(s, &want)?;
     ensure(
         mode(&s.route_path()) == 0o600 && mode(&s.yml_path()) == 0o600,
         "route.json and cloudflared.yml must be 0600",
     )?;
     let yml = fs::read_to_string(s.yml_path()).map_err(|e| e.to_string())?;
-    ensure(yml.matches("    path: '^/").count() == 22, "the yml must hold eleven paths for each of two hostnames")?;
-    ensure(yml.trim_end().ends_with("- service: http_status:404"), "the yml must end in a 404")?;
-    ensure(yml.contains(&format!("tunnel: {SHIM_TUNNEL}")), "the yml must name the created tunnel")?;
+    check_ingress(&yml, SHIM_TUNNEL, &["studio.example.com", "alt.example.com"], 18094, s.closed_port)?;
     let service = fs::read_to_string(s.service_file(true)).map_err(|e| e.to_string())?;
     ensure(
         service.contains(&s.shims.join("cloudflared").display().to_string())
@@ -526,29 +620,53 @@ fn tailnet(s: &Smoke) -> Result<(), String> {
     ensure(code == 0 && value["state"] == "needs_signin", "tailnet while signed out answers needs_signin")?;
     ensure(value["url"] == "https://login.tailscale.com/a/smoke", "needs_signin carries Tailscale's sign-in URL")?;
     fs::write(s.state.join("ts-up"), "").map_err(|e| e.to_string())?;
+    fs::write(s.state.join("ts-mounts"), "/mcp http://127.0.0.1:9/mcp\n").map_err(|e| e.to_string())?;
+    let mark = s.mark();
+    let (code, value) = s.ls(&args)?;
+    ensure(code == 1 && value["code"] == "tailnet_path", format!("a path served elsewhere is refused: {value}"))?;
+    ensure(
+        !s.since(mark).iter().any(|l| l.contains("--set-path")) && !s.route_path().exists(),
+        "the refusal changes nothing",
+    )?;
+    fs::write(s.state.join("ts-mounts"), "").map_err(|e| e.to_string())?;
+
+    fs::write(s.state.join("serve-no-allow-host"), "").map_err(|e| e.to_string())?;
+    let (code, value) = s.ls(&args)?;
+    fs::remove_file(s.state.join("serve-no-allow-host")).map_err(|e| e.to_string())?;
+    let command = format!("local-studio-serve allow-host {DNS} --json");
+    ensure(
+        code == 0 && value["state"] == "needs_serve_allow_host" && value["next"] == command.as_str(),
+        format!("a serve without allow-host answers needs_serve_allow_host: {value}"),
+    )?;
+    ensure(s.route_path().exists() && value["checks"]["health"] == "unchecked", "the rest of setup still finished")?;
+    let (code, value) = s.ls(&["tunnel", "off", "--json"])?;
+    ensure(code == 0 && value["state"] == "off", "off after needs_serve_allow_host")?;
+
     let mark = s.mark();
     let (code, value) = s.ls(&args)?;
     ensure(code == 0 && value["state"] == "ready", format!("setup --tailnet must be ready: {value}"))?;
-    ensure(value["hostname"] == DNS && value["ports"]["serve"] == 18093, "tailnet hostname and the local listener")?;
+    ensure(value["hostname"] == DNS && value["checks"]["health"] == "ok", "tailnet hostname and health")?;
     let lines = s.since(mark);
-    let mounts: Vec<&String> =
-        lines.iter().filter(|line| line.starts_with("tailscale serve --bg --yes --https=443 --set-path=")).collect();
-    ensure(mounts.len() == 11, format!("eleven set-path calls, got {}", mounts.len()))?;
-    for path in ["/v1/health", "/v1/ws"] {
-        Smoke::at(&lines, &format!("--set-path={path} http://127.0.0.1:18093{path}"))?;
-    }
-    for path in ["/mcp", "/.well-known/oauth-authorization-server/mcp", "/revoke", "/register", "/token", "/authorize"]
-    {
-        Smoke::at(&lines, &format!("--set-path={path} http://127.0.0.1:{stub}{path}"))?;
-    }
+    let mut got: Vec<String> = lines
+        .iter()
+        .filter_map(|line| line.strip_prefix("tailscale serve --bg --yes --https=443 "))
+        .map(ToString::to_string)
+        .collect();
+    let mut want: Vec<String> = eleven(18093, s.stub_port)
+        .into_iter()
+        .map(|(path, port)| format!("--set-path={path} http://127.0.0.1:{port}{path}"))
+        .collect();
+    got.sort();
+    want.sort();
+    ensure(got == want, format!("exactly the eleven set-path calls with their ports: {got:?}"))?;
     ensure(!s.log_lines().iter().any(|line| line.to_lowercase().contains("funnel")), "tailnet never mentions Funnel")?;
-    Smoke::at(&lines, &format!("local-studio-serve allow-tunnel-host {DNS}"))?;
+    Smoke::at(&lines, &command)?;
+    ensure(!Smoke::has(&lines, "allow-tunnel-host"), "the tailnet route never calls allow-tunnel-host")?;
+    Smoke::at(&lines, &format!("check {DNS} /v1/health 200"))?;
     Smoke::at(&lines, &format!("check {DNS} /mcp 401"))?;
-    let route: Value =
-        serde_json::from_slice(&fs::read(s.route_path()).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-    ensure(
-        route["route"] == "tailnet" && route["hostname"] == DNS && route["aliases"] == json!([]),
-        "tailnet route.json",
+    check_record(
+        s,
+        &json!({"v":1,"owner":"local-studio","route":"tailnet","hostname":DNS,"aliases":[],"ports":{"mcp":s.stub_port,"serve":18093}}),
     )?;
     let mark = s.mark();
     let (code, value) = s.ls(&["tunnel", "off", "--json"])?;
