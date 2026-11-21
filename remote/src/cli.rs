@@ -26,7 +26,7 @@ const USAGE: &str = "usage:
   local-studio-serve serve [--port 18093] [--tunnel-port 18094] [--allow-host <name>]... [--allow-tunnel-host <name>]... [--url <wss url>]... [--notify <url>]... [--eukhe <path>] [--name <name>] [--data-dir <dir>]
   local-studio-serve pair [--url <wss url>] [--port 18093] [--name <name>] [--data-dir <dir>]
   local-studio-serve devices [--data-dir <dir>]
-  local-studio-serve revoke (<device id or name> | --all) [--data-dir <dir>]
+  local-studio-serve revoke (<device id, key fingerprint prefix (8+ hex) or name> | --all) [--data-dir <dir>]
   local-studio-serve allow-host [--remove] [--json] <name> [--data-dir <dir>]
   local-studio-serve allow-tunnel-host [--remove] [--json] <name> [--data-dir <dir>]
   local-studio-serve install [--tailscale] [--https-port 443] [--bin <path>] [--eukhe <path>] [--no-load] [--json] [serve flags]
@@ -609,7 +609,7 @@ fn revoke(mut args: Args) -> anyhow::Result<()> {
         args.done()?;
         let gone = devices.revoke(&device)?;
         if gone.is_empty() {
-            bail!("no paired device has the id or name {device}");
+            bail!("no paired device has the id, key fingerprint prefix or name {device}");
         }
         gone
     };
