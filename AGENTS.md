@@ -38,3 +38,4 @@ Native desktop clients for local LLM work. The agent core is [Eukhe](https://git
 - Stop a scratch daemon: `cargo run -p local-studio-core --example smoke -- --stop <socket>`
 - Controller: `cd controller && bun install && bun run typecheck && bun run test`
 - Share one cargo target across worktrees: `CARGO_TARGET_DIR=/tmp/ls-cargo-target`
+- Do not write the PR description yourself. Ask the user to write it out after giving them sufficient information about the changes. If the user still asks you to write the description yourself, give them a warning but proceed with noting this override in the PR description.
